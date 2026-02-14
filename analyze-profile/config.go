@@ -20,6 +20,7 @@ type Config struct {
 	Columns    int
 	BatchSize  int
 
+	Partition         string
 	OutputDir         string
 	CPUProfileSeconds int
 	TiKVStatusPort    int
@@ -42,6 +43,14 @@ func (c *Config) StatusURL() string {
 
 func (c *Config) FullTableName() string {
 	return fmt.Sprintf("%s.%s", c.DB, c.Table)
+}
+
+func (c *Config) AnalyzeSQL() string {
+	sql := fmt.Sprintf("ANALYZE TABLE `%s`.`%s`", c.DB, c.Table)
+	if c.Partition != "" {
+		sql += " PARTITION " + c.Partition
+	}
+	return sql
 }
 
 func (c *Config) Validate() error {
@@ -89,6 +98,7 @@ func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.Columns, "columns", 50, "Number of columns")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 
+	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "./output", "Where to write profile results")
 	fs.IntVar(&cfg.CPUProfileSeconds, "cpu-profile-seconds", 10, "Duration for pprof CPU profile")
 	fs.IntVar(&cfg.TiKVStatusPort, "tikv-status-port", 20180, "TiKV status port (for metrics)")

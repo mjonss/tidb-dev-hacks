@@ -86,7 +86,7 @@ func runProfile(cfg *Config) error {
 	pprofCollector.StartCPULoop(ctx)
 
 	// Run ANALYZE
-	analyzeSQL := fmt.Sprintf("ANALYZE TABLE `%s`.`%s`", cfg.DB, cfg.Table)
+	analyzeSQL := cfg.AnalyzeSQL()
 	fmt.Fprintf(os.Stderr, "Running: %s\n", analyzeSQL)
 	startTime := time.Now()
 
