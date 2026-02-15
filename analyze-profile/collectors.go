@@ -401,17 +401,19 @@ func (t *LogTailer) Entries() []LogEntry {
 // PprofCollector captures heap and CPU profiles from TiDB's pprof endpoint.
 type PprofCollector struct {
 	cfg       *Config
+	outputDir string
 	mu        sync.Mutex
 	cpuFiles  []string
 	stopCh    chan struct{}
 	done      chan struct{}
 }
 
-func NewPprofCollector(cfg *Config) *PprofCollector {
+func NewPprofCollector(cfg *Config, outputDir string) *PprofCollector {
 	return &PprofCollector{
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
+		cfg:       cfg,
+		outputDir: outputDir,
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -435,7 +437,7 @@ func (p *PprofCollector) StartCPULoop(ctx context.Context) {
 			default:
 			}
 
-			path := fmt.Sprintf("%s/cpu_profile_%d.pb.gz", p.cfg.OutputDir, idx)
+			path := fmt.Sprintf("%s/cpu_profile_%d.pb.gz", p.outputDir, idx)
 			url := fmt.Sprintf("%s/debug/pprof/profile?seconds=%d", p.cfg.StatusURL(), p.cfg.CPUProfileSeconds)
 
 			err := downloadFile(url, path, time.Duration(p.cfg.CPUProfileSeconds+30)*time.Second)

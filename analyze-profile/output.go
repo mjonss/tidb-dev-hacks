@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
 )
 
 // ProfileResult is the top-level JSON output structure.
 type ProfileResult struct {
 	Config           OutputConfig          `json:"config"`
+	RunDir           string                `json:"run_dir"`
 	SessionVars      map[string]string     `json:"session_vars"`
 	AnalyzeDuration  string                `json:"analyze_duration"`
 	AnalyzeStartTime time.Time             `json:"analyze_start_time"`
@@ -197,6 +197,7 @@ func printSummary(result *ProfileResult) {
 
 	// Output files
 	fmt.Println("--- Output Files ---")
+	fmt.Printf("  %s/profile_result.json\n", result.RunDir)
 	if result.PprofFiles.HeapBefore != "" {
 		fmt.Printf("  %s\n", result.PprofFiles.HeapBefore)
 	}
@@ -206,7 +207,6 @@ func printSummary(result *ProfileResult) {
 	for _, f := range result.PprofFiles.CPUFiles {
 		fmt.Printf("  %s\n", f)
 	}
-	fmt.Printf("  %s/profile_result.json\n", strings.TrimRight(result.Config.DB, "/"))
 }
 
 func formatBytes(b float64) string {

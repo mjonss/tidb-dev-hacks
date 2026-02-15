@@ -25,10 +25,12 @@ var statsSessionVars = []string{
 }
 
 func runProfile(cfg *Config) error {
-	// Create output directory
-	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
+	// Create a timestamped output subdirectory to avoid overwriting previous runs
+	runDir := fmt.Sprintf("%s/run_%s", cfg.OutputDir, time.Now().Format("20060102_150405"))
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "Output dir: %s\n", runDir)
 
 	// Connect
 	db, err := sql.Open("mysql", cfg.DSN())
@@ -58,8 +60,8 @@ func runProfile(cfg *Config) error {
 	fmt.Fprintf(os.Stderr, "Capturing before state...\n")
 
 	// Heap before
-	pprofCollector := NewPprofCollector(cfg)
-	heapBeforePath := fmt.Sprintf("%s/heap_before.pb.gz", cfg.OutputDir)
+	pprofCollector := NewPprofCollector(cfg, runDir)
+	heapBeforePath := fmt.Sprintf("%s/heap_before.pb.gz", runDir)
 	if err := pprofCollector.CaptureHeap(heapBeforePath); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: heap before capture failed: %v\n", err)
 		heapBeforePath = ""
@@ -112,7 +114,7 @@ func runProfile(cfg *Config) error {
 	pprofCollector.Stop()
 
 	// Heap after
-	heapAfterPath := fmt.Sprintf("%s/heap_after.pb.gz", cfg.OutputDir)
+	heapAfterPath := fmt.Sprintf("%s/heap_after.pb.gz", runDir)
 	if err := pprofCollector.CaptureHeap(heapAfterPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: heap after capture failed: %v\n", err)
 		heapAfterPath = ""
@@ -145,6 +147,7 @@ func runProfile(cfg *Config) error {
 			Rows:       cfg.Rows,
 			Columns:    cfg.Columns,
 		},
+		RunDir:      runDir,
 		SessionVars:      sessionVars,
 		AnalyzeDuration:  duration.Round(time.Millisecond).String(),
 		AnalyzeStartTime: startTime,
@@ -163,7 +166,7 @@ func runProfile(cfg *Config) error {
 	}
 
 	// Write JSON
-	jsonPath := fmt.Sprintf("%s/profile_result.json", cfg.OutputDir)
+	jsonPath := fmt.Sprintf("%s/profile_result.json", runDir)
 	if err := writeJSONResult(jsonPath, result); err != nil {
 		return fmt.Errorf("write JSON: %w", err)
 	}
