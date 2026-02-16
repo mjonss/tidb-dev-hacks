@@ -22,6 +22,7 @@ var statsSessionVars = []string{
 	"tidb_analyze_version",
 	"tidb_partition_prune_mode",
 	"tidb_build_sampling_stats_concurrency",
+	"tidb_enable_sample_based_global_stats",
 }
 
 func runProfile(cfg *Config) error {
