@@ -32,6 +32,7 @@ type Config struct {
 
 	PartitionProfile  string
 	Partition         string
+	AnalyzeColumns    string
 	SetVariables      stringSlice
 	OutputDir         string
 	CPUProfileSeconds int
@@ -61,6 +62,16 @@ func (c *Config) AnalyzeSQL() string {
 	sql := fmt.Sprintf("ANALYZE TABLE `%s`.`%s`", c.DB, c.Table)
 	if c.Partition != "" {
 		sql += " PARTITION " + c.Partition
+	}
+	switch strings.ToLower(c.AnalyzeColumns) {
+	case "":
+		// no clause
+	case "all":
+		sql += " ALL COLUMNS"
+	case "predicate":
+		sql += " PREDICATE COLUMNS"
+	default:
+		sql += " COLUMNS " + c.AnalyzeColumns
 	}
 	return sql
 }
@@ -96,6 +107,16 @@ func (c *Config) Validate() error {
 	if c.CPUProfileSeconds < 1 {
 		return fmt.Errorf("--cpu-profile-seconds must be >= 1")
 	}
+	if c.AnalyzeColumns != "" {
+		v := strings.ToLower(c.AnalyzeColumns)
+		if v != "all" && v != "predicate" {
+			for _, col := range strings.Split(c.AnalyzeColumns, ",") {
+				if strings.TrimSpace(col) == "" {
+					return fmt.Errorf("--analyze-columns contains an empty column name")
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -115,6 +136,7 @@ func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
 
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
 	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")
+	fs.StringVar(&cfg.AnalyzeColumns, "analyze-columns", "", "Column selection for ANALYZE: all, predicate, or comma-separated column list (e.g. \"c1,c2,c3\"); empty = server default")
 	fs.Var(&cfg.SetVariables, "set-variable", "Set a session+global variable before ANALYZE (e.g. \"tidb_enable_sample_based_global_stats=ON\"); repeatable")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "./output", "Where to write profile results")
 	fs.IntVar(&cfg.CPUProfileSeconds, "cpu-profile-seconds", 10, "Duration for pprof CPU profile")
