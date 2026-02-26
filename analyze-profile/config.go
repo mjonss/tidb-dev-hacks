@@ -4,7 +4,17 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"strings"
 )
+
+// stringSlice implements flag.Value for repeated string flags.
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
 
 type Config struct {
 	Host       string
@@ -21,6 +31,7 @@ type Config struct {
 	BatchSize  int
 
 	Partition         string
+	SetVariables      stringSlice
 	OutputDir         string
 	CPUProfileSeconds int
 	TiKVStatusPort    int
@@ -99,6 +110,7 @@ func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 
 	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")
+	fs.Var(&cfg.SetVariables, "set-variable", "Set a session+global variable before ANALYZE (e.g. \"tidb_enable_sample_based_global_stats=ON\"); repeatable")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "./output", "Where to write profile results")
 	fs.IntVar(&cfg.CPUProfileSeconds, "cpu-profile-seconds", 10, "Duration for pprof CPU profile")
 	fs.IntVar(&cfg.TiKVStatusPort, "tikv-status-port", 20180, "TiKV status port (for metrics)")

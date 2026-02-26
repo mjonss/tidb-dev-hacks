@@ -45,6 +45,23 @@ func runProfile(cfg *Config) error {
 	}
 	fmt.Fprintf(os.Stderr, "Connected to %s:%d\n", cfg.Host, cfg.Port)
 
+	// Set user-requested variables on both global and session level
+	for _, sv := range cfg.SetVariables {
+		parts := strings.SplitN(sv, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("--set-variable %q: expected name=value", sv)
+		}
+		name, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		for _, scope := range []string{"GLOBAL", "SESSION"} {
+			setSQL := fmt.Sprintf("SET @@%s.%s = '%s'", scope, name, value)
+			if _, err := db.Exec(setSQL); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: %s failed: %v\n", setSQL, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Set %s %s = %s\n", scope, name, value)
+			}
+		}
+	}
+
 	// Verify table exists
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
