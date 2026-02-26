@@ -36,6 +36,10 @@ go run ./analyze-profile setup [flags]
 | `--rows` | 10000000 | Number of rows to insert |
 | `--columns` | 50 | Number of columns (cycles through INT, BIGINT, CHAR, VARCHAR, DECIMAL, FLOAT, DOUBLE, DATE, DATETIME, TIMESTAMP) |
 | `--batch-size` | 5000 | INSERT batch size |
+| `--insert-concurrency` | 8 | Number of parallel partition inserters |
+| `--seed` | 0 | Random seed for data generation (0 = random, printed for reproducibility) |
+| `--partition-profile` | uniform | Data distribution across partitions: `uniform`, `range-like`, `size-skew` |
+| `--analyze-columns` | "" | Column selection for ANALYZE: `all`, `predicate`, or comma-separated list (e.g. `c1,c2,c3`); empty = server default |
 
 #### 2. Profile — run ANALYZE and collect data
 
