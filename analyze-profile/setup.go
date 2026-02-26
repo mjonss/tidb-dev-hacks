@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -126,7 +128,6 @@ func buildCreateTable(cfg *Config) string {
 }
 
 func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tms := typeMappers()
 	dists := distributions()
 
@@ -170,9 +171,34 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 		colDistIdx[i] = distIdx
 	}
 
-	totalInserted := 0
-	lastReport := time.Now()
+	// Ensure the connection pool can support the desired concurrency.
+	db.SetMaxOpenConns(cfg.InsertConcurrency + 2)
+
+	var totalInserted atomic.Int64
 	startTime := time.Now()
+
+	// Progress ticker in main goroutine.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				n := totalInserted.Load()
+				elapsed := time.Since(startTime)
+				rate := float64(n) / elapsed.Seconds()
+				fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (%.0f rows/s)\n",
+					n, cfg.Rows, rate)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	sem := make(chan struct{}, cfg.InsertConcurrency)
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1) // first error wins
 
 	for partID := 0; partID < cfg.Partitions; partID++ {
 		rowsForPart := partRows[partID]
@@ -180,60 +206,85 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 			continue
 		}
 
-		inserted := 0
-		for inserted < rowsForPart {
-			batchSize := cfg.BatchSize
-			if inserted+batchSize > rowsForPart {
-				batchSize = rowsForPart - inserted
-			}
+		wg.Add(1)
+		sem <- struct{}{} // acquire slot
 
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (%s) VALUES ", cfg.Table, colList))
+		go func(partID, rowsForPart int) {
+			defer wg.Done()
+			defer func() { <-sem }() // release slot
 
-			for row := 0; row < batchSize; row++ {
-				seqIdx := inserted + row + 1 // 1-based within partition
-				if row > 0 {
-					sb.WriteString(", ")
+			rng := rand.New(rand.NewSource(int64(partID) ^ time.Now().UnixNano()))
+
+			inserted := 0
+			for inserted < rowsForPart {
+				// Check for early abort.
+				select {
+				case <-errCh:
+					return
+				default:
 				}
-				sb.WriteString("(")
 
-				// pk
-				pk := pkForPartition(seqIdx, partID, cfg.Partitions)
-				sb.WriteString(fmt.Sprintf("%d", pk))
+				batchSize := cfg.BatchSize
+				if inserted+batchSize > rowsForPart {
+					batchSize = rowsForPart - inserted
+				}
 
-				for col := 0; col < cfg.Columns; col++ {
-					sb.WriteString(", ")
-					tm := tms[col%len(tms)]
-					distIdx := colDistIdx[col]
+				var sb strings.Builder
+				sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (%s) VALUES ", cfg.Table, colList))
 
-					// For nullable columns, occasionally insert NULL
-					cycle := col / len(tms)
-					if cycle%2 == 0 && rng.Intn(20) == 0 {
-						sb.WriteString("NULL")
-					} else {
-						v := dists[distIdx](rng, seqIdx, rowsForPart, partID, cfg.Partitions)
-						sb.WriteString(tm.MapFunc(v, rng))
+				for row := 0; row < batchSize; row++ {
+					seqIdx := inserted + row + 1 // 1-based within partition
+					if row > 0 {
+						sb.WriteString(", ")
 					}
+					sb.WriteString("(")
+
+					// pk
+					pk := pkForPartition(seqIdx, partID, cfg.Partitions)
+					sb.WriteString(fmt.Sprintf("%d", pk))
+
+					for col := 0; col < cfg.Columns; col++ {
+						sb.WriteString(", ")
+						tm := tms[col%len(tms)]
+						distIdx := colDistIdx[col]
+
+						// For nullable columns, occasionally insert NULL
+						cycle := col / len(tms)
+						if cycle%2 == 0 && rng.Intn(20) == 0 {
+							sb.WriteString("NULL")
+						} else {
+							v := dists[distIdx](rng, seqIdx, rowsForPart, partID, cfg.Partitions)
+							sb.WriteString(tm.MapFunc(v, rng))
+						}
+					}
+					sb.WriteString(")")
 				}
-				sb.WriteString(")")
-			}
 
-			if _, err := db.Exec(sb.String()); err != nil {
-				return fmt.Errorf("batch insert at partition p%d, row %d: %w", partID, inserted, err)
-			}
+				if _, err := db.Exec(sb.String()); err != nil {
+					// Send error non-blocking (only first error kept).
+					select {
+					case errCh <- fmt.Errorf("batch insert at partition p%d, row %d: %w", partID, inserted, err):
+					default:
+					}
+					return
+				}
 
-			inserted += batchSize
-			totalInserted += batchSize
-			if time.Since(lastReport) > 2*time.Second {
-				elapsed := time.Since(startTime)
-				rate := float64(totalInserted) / elapsed.Seconds()
-				fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (%.0f rows/s) [partition p%d]\n",
-					totalInserted, cfg.Rows, rate, partID)
-				lastReport = time.Now()
+				inserted += batchSize
+				totalInserted.Add(int64(batchSize))
 			}
-		}
+		}(partID, rowsForPart)
 	}
 
-	fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (done)\n", totalInserted, cfg.Rows)
+	wg.Wait()
+	close(done) // stop progress ticker
+
+	// Check for error.
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+
+	fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (done)\n", totalInserted.Load(), cfg.Rows)
 	return nil
 }
