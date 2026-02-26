@@ -404,6 +404,7 @@ type PprofCollector struct {
 	outputDir string
 	mu        sync.Mutex
 	cpuFiles  []string
+	heapFiles []string
 	stopCh    chan struct{}
 	done      chan struct{}
 }
@@ -423,8 +424,9 @@ func (p *PprofCollector) CaptureHeap(path string) error {
 	return downloadFile(url, path, 30*time.Second)
 }
 
-// StartCPULoop captures CPU profiles in a loop until stopped.
-func (p *PprofCollector) StartCPULoop(ctx context.Context) {
+// StartLoop captures CPU and heap profiles in a loop until stopped.
+// A heap snapshot is taken before each CPU profile starts.
+func (p *PprofCollector) StartLoop(ctx context.Context) {
 	go func() {
 		defer close(p.done)
 		idx := 0
@@ -437,13 +439,23 @@ func (p *PprofCollector) StartCPULoop(ctx context.Context) {
 			default:
 			}
 
-			path := fmt.Sprintf("%s/cpu_profile_%d.pb.gz", p.outputDir, idx)
+			// Heap snapshot
+			heapPath := fmt.Sprintf("%s/heap_%d.pb.gz", p.outputDir, idx)
+			if err := p.CaptureHeap(heapPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: heap snapshot %d failed: %v\n", idx, err)
+			} else {
+				p.mu.Lock()
+				p.heapFiles = append(p.heapFiles, heapPath)
+				p.mu.Unlock()
+			}
+
+			// CPU profile
+			cpuPath := fmt.Sprintf("%s/cpu_profile_%d.pb.gz", p.outputDir, idx)
 			url := fmt.Sprintf("%s/debug/pprof/profile?seconds=%d", p.cfg.StatusURL(), p.cfg.CPUProfileSeconds)
 
-			err := downloadFile(url, path, time.Duration(p.cfg.CPUProfileSeconds+30)*time.Second)
+			err := downloadFile(url, cpuPath, time.Duration(p.cfg.CPUProfileSeconds+30)*time.Second)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: CPU profile %d failed: %v\n", idx, err)
-				// Check if we should stop
 				select {
 				case <-p.stopCh:
 					return
@@ -456,7 +468,7 @@ func (p *PprofCollector) StartCPULoop(ctx context.Context) {
 			}
 
 			p.mu.Lock()
-			p.cpuFiles = append(p.cpuFiles, path)
+			p.cpuFiles = append(p.cpuFiles, cpuPath)
 			p.mu.Unlock()
 			idx++
 		}
@@ -473,6 +485,14 @@ func (p *PprofCollector) CPUFiles() []string {
 	defer p.mu.Unlock()
 	out := make([]string, len(p.cpuFiles))
 	copy(out, p.cpuFiles)
+	return out
+}
+
+func (p *PprofCollector) HeapFiles() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.heapFiles))
+	copy(out, p.heapFiles)
 	return out
 }
 

@@ -55,9 +55,8 @@ type SlowQueryEntry struct {
 }
 
 type PprofFiles struct {
-	HeapBefore string   `json:"heap_before"`
-	HeapAfter  string   `json:"heap_after"`
-	CPUFiles   []string `json:"cpu_files"`
+	HeapFiles []string `json:"heap_files"`
+	CPUFiles  []string `json:"cpu_files"`
 }
 
 type AnalyzeStatusEntry struct {
@@ -198,11 +197,8 @@ func printSummary(result *ProfileResult) {
 	// Output files
 	fmt.Println("--- Output Files ---")
 	fmt.Printf("  %s/profile_result.json\n", result.RunDir)
-	if result.PprofFiles.HeapBefore != "" {
-		fmt.Printf("  %s\n", result.PprofFiles.HeapBefore)
-	}
-	if result.PprofFiles.HeapAfter != "" {
-		fmt.Printf("  %s\n", result.PprofFiles.HeapAfter)
+	for _, f := range result.PprofFiles.HeapFiles {
+		fmt.Printf("  %s\n", f)
 	}
 	for _, f := range result.PprofFiles.CPUFiles {
 		fmt.Printf("  %s\n", f)

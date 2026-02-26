@@ -74,19 +74,10 @@ func runProfile(cfg *Config) error {
 	sessionVars := captureSessionVars(db)
 	fmt.Fprintf(os.Stderr, "Captured %d session variables\n", len(sessionVars))
 
-	// Capture "before" analyze status
-	fmt.Fprintf(os.Stderr, "Capturing before state...\n")
-
-	// Heap before
-	pprofCollector := NewPprofCollector(cfg, runDir)
-	heapBeforePath := fmt.Sprintf("%s/heap_before.pb.gz", runDir)
-	if err := pprofCollector.CaptureHeap(heapBeforePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: heap before capture failed: %v\n", err)
-		heapBeforePath = ""
-	}
-
 	// Start collectors
 	fmt.Fprintf(os.Stderr, "Starting collectors...\n")
+
+	pprofCollector := NewPprofCollector(cfg, runDir)
 
 	jobsPoller := NewAnalyzeJobsPoller(db, cfg)
 	jobsPoller.Start()
@@ -101,9 +92,9 @@ func runProfile(cfg *Config) error {
 		fmt.Fprintf(os.Stderr, "Tailing log: %s\n", cfg.TiDBLog)
 	}
 
-	// Start CPU profiling loop
+	// Start pprof loop (heap snapshot + CPU profile each iteration)
 	ctx, cancel := context.WithCancel(context.Background())
-	pprofCollector.StartCPULoop(ctx)
+	pprofCollector.StartLoop(ctx)
 
 	// Run ANALYZE
 	analyzeSQL := cfg.AnalyzeSQL()
@@ -131,11 +122,14 @@ func runProfile(cfg *Config) error {
 	}
 	pprofCollector.Stop()
 
-	// Heap after
-	heapAfterPath := fmt.Sprintf("%s/heap_after.pb.gz", runDir)
-	if err := pprofCollector.CaptureHeap(heapAfterPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: heap after capture failed: %v\n", err)
-		heapAfterPath = ""
+	// Final heap snapshot after ANALYZE
+	finalHeapPath := fmt.Sprintf("%s/heap_%d.pb.gz", runDir, len(pprofCollector.HeapFiles()))
+	if err := pprofCollector.CaptureHeap(finalHeapPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: final heap snapshot failed: %v\n", err)
+	} else {
+		pprofCollector.mu.Lock()
+		pprofCollector.heapFiles = append(pprofCollector.heapFiles, finalHeapPath)
+		pprofCollector.mu.Unlock()
 	}
 
 	// Capture "after" analyze status
@@ -176,9 +170,8 @@ func runProfile(cfg *Config) error {
 		LogEntries:       logEntries,
 		SlowQueries:      slowQueries,
 		PprofFiles: PprofFiles{
-			HeapBefore: heapBeforePath,
-			HeapAfter:  heapAfterPath,
-			CPUFiles:   pprofCollector.CPUFiles(),
+			HeapFiles: pprofCollector.HeapFiles(),
+			CPUFiles:  pprofCollector.CPUFiles(),
 		},
 		AnalyzeStatus: analyzeStatus,
 	}
