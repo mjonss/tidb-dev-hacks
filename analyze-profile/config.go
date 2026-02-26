@@ -30,6 +30,7 @@ type Config struct {
 	Columns    int
 	BatchSize         int
 	InsertConcurrency int
+	Seed              int64
 
 	PartitionProfile  string
 	Partition         string
@@ -138,6 +139,7 @@ func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.Columns, "columns", 50, "Number of columns")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 	fs.IntVar(&cfg.InsertConcurrency, "insert-concurrency", 8, "Number of parallel partition inserters")
+	fs.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = random, printed for reproducibility)")
 
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
 	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")

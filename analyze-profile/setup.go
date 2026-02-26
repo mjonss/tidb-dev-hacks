@@ -29,6 +29,12 @@ func runSetup(cfg *Config) error {
 
 	profile, _ := ParsePartitionProfile(cfg.PartitionProfile)
 
+	// Resolve random seed.
+	if cfg.Seed == 0 {
+		cfg.Seed = time.Now().UnixNano()
+	}
+	fmt.Fprintf(os.Stderr, "Seed: %d\n", cfg.Seed)
+
 	// Connect without database to create it
 	db, err := sql.Open("mysql", cfg.DSNNoDB())
 	if err != nil {
@@ -213,7 +219,7 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			rng := rand.New(rand.NewSource(int64(partID) ^ time.Now().UnixNano()))
+			rng := rand.New(rand.NewSource(cfg.Seed + int64(partID)))
 
 			inserted := 0
 			for inserted < rowsForPart {
