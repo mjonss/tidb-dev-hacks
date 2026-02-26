@@ -30,6 +30,7 @@ type Config struct {
 	Columns    int
 	BatchSize  int
 
+	PartitionProfile  string
 	Partition         string
 	SetVariables      stringSlice
 	OutputDir         string
@@ -89,6 +90,9 @@ func (c *Config) Validate() error {
 	if c.BatchSize < 1 {
 		return fmt.Errorf("--batch-size must be >= 1")
 	}
+	if _, err := ParsePartitionProfile(c.PartitionProfile); err != nil {
+		return err
+	}
 	if c.CPUProfileSeconds < 1 {
 		return fmt.Errorf("--cpu-profile-seconds must be >= 1")
 	}
@@ -109,6 +113,7 @@ func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.Columns, "columns", 50, "Number of columns")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 
+	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
 	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")
 	fs.Var(&cfg.SetVariables, "set-variable", "Set a session+global variable before ANALYZE (e.g. \"tidb_enable_sample_based_global_stats=ON\"); repeatable")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "./output", "Where to write profile results")

@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"strings"
@@ -10,32 +11,6 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 )
-
-// Column type definitions that cycle through various types.
-var columnTypes = []struct {
-	typeName string
-	genFunc  func(rng *rand.Rand) string
-}{
-	{"INT", func(rng *rand.Rand) string { return fmt.Sprintf("%d", rng.Int31()) }},
-	{"BIGINT", func(rng *rand.Rand) string { return fmt.Sprintf("%d", rng.Int63()) }},
-	{"CHAR(32)", func(rng *rand.Rand) string { return fmt.Sprintf("'%s'", randString(rng, 32)) }},
-	{"VARCHAR(255)", func(rng *rand.Rand) string { return fmt.Sprintf("'%s'", randString(rng, 10+rng.Intn(50))) }},
-	{"DECIMAL(10,2)", func(rng *rand.Rand) string { return fmt.Sprintf("%.2f", rng.Float64()*100000) }},
-	{"FLOAT", func(rng *rand.Rand) string { return fmt.Sprintf("%f", rng.Float32()*1000) }},
-	{"DOUBLE", func(rng *rand.Rand) string { return fmt.Sprintf("%f", rng.Float64()*100000) }},
-	{"DATE", func(rng *rand.Rand) string {
-		d := time.Date(2000+rng.Intn(25), time.Month(1+rng.Intn(12)), 1+rng.Intn(28), 0, 0, 0, 0, time.UTC)
-		return fmt.Sprintf("'%s'", d.Format("2006-01-02"))
-	}},
-	{"DATETIME", func(rng *rand.Rand) string {
-		d := time.Date(2000+rng.Intn(25), time.Month(1+rng.Intn(12)), 1+rng.Intn(28), rng.Intn(24), rng.Intn(60), rng.Intn(60), 0, time.UTC)
-		return fmt.Sprintf("'%s'", d.Format("2006-01-02 15:04:05"))
-	}},
-	{"TIMESTAMP", func(rng *rand.Rand) string {
-		d := time.Date(2010+rng.Intn(15), time.Month(1+rng.Intn(12)), 1+rng.Intn(28), rng.Intn(24), rng.Intn(60), rng.Intn(60), 0, time.UTC)
-		return fmt.Sprintf("'%s'", d.Format("2006-01-02 15:04:05"))
-	}},
-}
 
 const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -49,6 +24,8 @@ func randString(rng *rand.Rand, n int) string {
 
 func runSetup(cfg *Config) error {
 	start := time.Now()
+
+	profile, _ := ParsePartitionProfile(cfg.PartitionProfile)
 
 	// Connect without database to create it
 	db, err := sql.Open("mysql", cfg.DSNNoDB())
@@ -90,7 +67,7 @@ func runSetup(cfg *Config) error {
 	fmt.Fprintf(os.Stderr, "Created table: %s (%d columns, %d partitions)\n", cfg.Table, cfg.Columns, cfg.Partitions)
 
 	// Bulk insert
-	if err := bulkInsert(db, cfg); err != nil {
+	if err := bulkInsert(db, cfg, profile); err != nil {
 		return fmt.Errorf("insert: %w", err)
 	}
 
@@ -98,6 +75,7 @@ func runSetup(cfg *Config) error {
 	fmt.Printf("\n=== Setup Complete ===\n")
 	fmt.Printf("  Table:      %s.%s\n", cfg.DB, cfg.Table)
 	fmt.Printf("  Partitions: %d (HASH)\n", cfg.Partitions)
+	fmt.Printf("  Profile:    %s\n", cfg.PartitionProfile)
 	fmt.Printf("  Rows:       %d\n", cfg.Rows)
 	fmt.Printf("  Columns:    %d\n", cfg.Columns)
 	fmt.Printf("  Elapsed:    %s\n", elapsed.Round(time.Millisecond))
@@ -105,15 +83,17 @@ func runSetup(cfg *Config) error {
 }
 
 func buildCreateTable(cfg *Config) string {
+	tms := typeMappers()
+
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", cfg.Table))
-	sb.WriteString("  `pk` BIGINT NOT NULL AUTO_INCREMENT,\n")
+	sb.WriteString("  `pk` BIGINT NOT NULL,\n")
 
 	for i := 0; i < cfg.Columns; i++ {
-		ct := columnTypes[i%len(columnTypes)]
+		tm := tms[i%len(tms)]
 		colName := fmt.Sprintf("c%d", i+1)
 		// Cycle NULL/NOT NULL: first cycle allows NULL, next does NOT, etc.
-		cycle := i / len(columnTypes)
+		cycle := i / len(tms)
 		nullable := "NULL"
 		if cycle%2 == 1 {
 			nullable = "NOT NULL"
@@ -122,21 +102,21 @@ func buildCreateTable(cfg *Config) string {
 		defaultClause := ""
 		if nullable == "NOT NULL" {
 			switch {
-			case strings.HasPrefix(ct.typeName, "INT"), strings.HasPrefix(ct.typeName, "BIGINT"):
+			case strings.HasPrefix(tm.TypeName, "INT"), strings.HasPrefix(tm.TypeName, "BIGINT"):
 				defaultClause = " DEFAULT 0"
-			case strings.HasPrefix(ct.typeName, "CHAR"), strings.HasPrefix(ct.typeName, "VARCHAR"):
+			case strings.HasPrefix(tm.TypeName, "CHAR"), strings.HasPrefix(tm.TypeName, "VARCHAR"):
 				defaultClause = " DEFAULT ''"
-			case strings.HasPrefix(ct.typeName, "DECIMAL"), strings.HasPrefix(ct.typeName, "FLOAT"), strings.HasPrefix(ct.typeName, "DOUBLE"):
+			case strings.HasPrefix(tm.TypeName, "DECIMAL"), strings.HasPrefix(tm.TypeName, "FLOAT"), strings.HasPrefix(tm.TypeName, "DOUBLE"):
 				defaultClause = " DEFAULT 0"
-			case ct.typeName == "DATE":
+			case tm.TypeName == "DATE":
 				defaultClause = " DEFAULT '2000-01-01'"
-			case ct.typeName == "DATETIME":
+			case tm.TypeName == "DATETIME":
 				defaultClause = " DEFAULT '2000-01-01 00:00:00'"
-			case ct.typeName == "TIMESTAMP":
+			case tm.TypeName == "TIMESTAMP":
 				defaultClause = " DEFAULT CURRENT_TIMESTAMP"
 			}
 		}
-		sb.WriteString(fmt.Sprintf("  `%s` %s %s%s", colName, ct.typeName, nullable, defaultClause))
+		sb.WriteString(fmt.Sprintf("  `%s` %s %s%s", colName, tm.TypeName, nullable, defaultClause))
 		sb.WriteString(",\n")
 	}
 
@@ -145,63 +125,115 @@ func buildCreateTable(cfg *Config) string {
 	return sb.String()
 }
 
-func bulkInsert(db *sql.DB, cfg *Config) error {
+func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	tms := typeMappers()
+	dists := distributions()
 
-	// Build column name list
-	colNames := make([]string, cfg.Columns)
+	// Compute per-partition row counts from weights
+	weights := partitionWeights(profile, cfg.Partitions)
+	partRows := make([]int, cfg.Partitions)
+	assigned := 0
+	for i, w := range weights {
+		partRows[i] = int(math.Round(w * float64(cfg.Rows)))
+		assigned += partRows[i]
+	}
+	// Adjust rounding error on the last non-zero partition
+	diff := cfg.Rows - assigned
+	if diff != 0 {
+		for i := len(partRows) - 1; i >= 0; i-- {
+			if partRows[i] > 0 || diff > 0 {
+				partRows[i] += diff
+				break
+			}
+		}
+	}
+
+	// Build column name list (including pk)
+	colNames := make([]string, 0, cfg.Columns+1)
+	colNames = append(colNames, "`pk`")
 	for i := 0; i < cfg.Columns; i++ {
-		colNames[i] = fmt.Sprintf("`c%d`", i+1)
+		colNames = append(colNames, fmt.Sprintf("`c%d`", i+1))
 	}
 	colList := strings.Join(colNames, ", ")
 
-	inserted := 0
+	// Determine distribution index for each column, with fallback for
+	// string types + sequential distribution
+	colDistIdx := make([]int, cfg.Columns)
+	for i := 0; i < cfg.Columns; i++ {
+		distIdx := i % len(dists)
+		tm := tms[i%len(tms)]
+		// Sequential distribution is meaningless for string types; fall back to Uniform
+		if isSequentialDist(distIdx) && isStringType(tm) {
+			distIdx = 0
+		}
+		colDistIdx[i] = distIdx
+	}
+
+	totalInserted := 0
 	lastReport := time.Now()
 	startTime := time.Now()
 
-	for inserted < cfg.Rows {
-		batchSize := cfg.BatchSize
-		if inserted+batchSize > cfg.Rows {
-			batchSize = cfg.Rows - inserted
+	for partID := 0; partID < cfg.Partitions; partID++ {
+		rowsForPart := partRows[partID]
+		if rowsForPart == 0 {
+			continue
 		}
 
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (%s) VALUES ", cfg.Table, colList))
-
-		for row := 0; row < batchSize; row++ {
-			if row > 0 {
-				sb.WriteString(", ")
+		inserted := 0
+		for inserted < rowsForPart {
+			batchSize := cfg.BatchSize
+			if inserted+batchSize > rowsForPart {
+				batchSize = rowsForPart - inserted
 			}
-			sb.WriteString("(")
-			for col := 0; col < cfg.Columns; col++ {
-				if col > 0 {
+
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("INSERT INTO `%s` (%s) VALUES ", cfg.Table, colList))
+
+			for row := 0; row < batchSize; row++ {
+				seqIdx := inserted + row + 1 // 1-based within partition
+				if row > 0 {
 					sb.WriteString(", ")
 				}
-				ct := columnTypes[col%len(columnTypes)]
-				// For nullable columns, occasionally insert NULL
-				cycle := col / len(columnTypes)
-				if cycle%2 == 0 && rng.Intn(20) == 0 {
-					sb.WriteString("NULL")
-				} else {
-					sb.WriteString(ct.genFunc(rng))
+				sb.WriteString("(")
+
+				// pk
+				pk := pkForPartition(seqIdx, partID, cfg.Partitions)
+				sb.WriteString(fmt.Sprintf("%d", pk))
+
+				for col := 0; col < cfg.Columns; col++ {
+					sb.WriteString(", ")
+					tm := tms[col%len(tms)]
+					distIdx := colDistIdx[col]
+
+					// For nullable columns, occasionally insert NULL
+					cycle := col / len(tms)
+					if cycle%2 == 0 && rng.Intn(20) == 0 {
+						sb.WriteString("NULL")
+					} else {
+						v := dists[distIdx](rng, seqIdx, rowsForPart, partID, cfg.Partitions)
+						sb.WriteString(tm.MapFunc(v, rng))
+					}
 				}
+				sb.WriteString(")")
 			}
-			sb.WriteString(")")
-		}
 
-		if _, err := db.Exec(sb.String()); err != nil {
-			return fmt.Errorf("batch insert at row %d: %w", inserted, err)
-		}
+			if _, err := db.Exec(sb.String()); err != nil {
+				return fmt.Errorf("batch insert at partition p%d, row %d: %w", partID, inserted, err)
+			}
 
-		inserted += batchSize
-		if time.Since(lastReport) > 2*time.Second {
-			elapsed := time.Since(startTime)
-			rate := float64(inserted) / elapsed.Seconds()
-			fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (%.0f rows/s)\n", inserted, cfg.Rows, rate)
-			lastReport = time.Now()
+			inserted += batchSize
+			totalInserted += batchSize
+			if time.Since(lastReport) > 2*time.Second {
+				elapsed := time.Since(startTime)
+				rate := float64(totalInserted) / elapsed.Seconds()
+				fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (%.0f rows/s) [partition p%d]\n",
+					totalInserted, cfg.Rows, rate, partID)
+				lastReport = time.Now()
+			}
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (done)\n", inserted, cfg.Rows)
+	fmt.Fprintf(os.Stderr, "  Inserted %d/%d rows (done)\n", totalInserted, cfg.Rows)
 	return nil
 }
