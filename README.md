@@ -48,6 +48,7 @@ All flags from `setup` apply, plus:
 | Flag | Default | Description |
 |---|---|---|
 | `--partition` | "" | Comma-separated partition names to analyze (e.g. `p0,p1`); empty = all partitions |
+| `--set-variable` | | Set a session+global variable before ANALYZE (repeatable, e.g. `--set-variable "tidb_enable_sample_based_global_stats=ON"`) |
 | `--status-port` | 10080 | TiDB status port (pprof/metrics) |
 | `--output-dir` | ./output | Base directory for results |
 | `--cpu-profile-seconds` | 10 | Duration per pprof CPU profile capture |
@@ -82,6 +83,11 @@ go run ./analyze-profile profile
 
 # Profile ANALYZE on specific partitions only (faster, useful for merge profiling)
 go run ./analyze-profile profile --partition "p0,p1"
+
+# Set TiDB session/global variables before running ANALYZE
+go run ./analyze-profile profile \
+  --set-variable "tidb_enable_sample_based_global_stats=ON" \
+  --set-variable "tidb_build_stats_concurrency=4"
 
 # View CPU profile
 go tool pprof output/run_*/cpu_profile_0.pb.gz
