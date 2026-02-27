@@ -17,9 +17,9 @@ func main() {
 	case "setup":
 		cfg := &Config{}
 		fs := flag.NewFlagSet("setup", flag.ExitOnError)
-		RegisterFlags(fs, cfg)
+		RegisterSetupFlags(fs, cfg)
 		fs.Parse(os.Args[2:])
-		if err := cfg.Validate(); err != nil {
+		if err := cfg.ValidateSetup(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -31,9 +31,9 @@ func main() {
 	case "profile":
 		cfg := &Config{}
 		fs := flag.NewFlagSet("profile", flag.ExitOnError)
-		RegisterFlags(fs, cfg)
+		RegisterProfileFlags(fs, cfg)
 		fs.Parse(os.Args[2:])
-		if err := cfg.Validate(); err != nil {
+		if err := cfg.ValidateProfile(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

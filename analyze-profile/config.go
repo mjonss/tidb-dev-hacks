@@ -78,7 +78,7 @@ func (c *Config) AnalyzeSQL() string {
 	return sql
 }
 
-func (c *Config) Validate() error {
+func (c *Config) validateCommon() error {
 	if c.Host == "" {
 		return fmt.Errorf("--host is required")
 	}
@@ -90,6 +90,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Table == "" {
 		return fmt.Errorf("--table is required")
+	}
+	return nil
+}
+
+func (c *Config) ValidateSetup() error {
+	if err := c.validateCommon(); err != nil {
+		return err
 	}
 	if c.Partitions < 1 {
 		return fmt.Errorf("--partitions must be >= 1")
@@ -109,6 +116,13 @@ func (c *Config) Validate() error {
 	if _, err := ParsePartitionProfile(c.PartitionProfile); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (c *Config) ValidateProfile() error {
+	if err := c.validateCommon(); err != nil {
+		return err
+	}
 	if c.CPUProfileSeconds < 1 {
 		return fmt.Errorf("--cpu-profile-seconds must be >= 1")
 	}
@@ -125,23 +139,29 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func RegisterFlags(fs *flag.FlagSet, cfg *Config) {
+func registerCommonFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.Host, "host", "127.0.0.1", "TiDB host")
 	fs.IntVar(&cfg.Port, "port", 4000, "TiDB SQL port")
 	fs.StringVar(&cfg.User, "user", "root", "DB user")
 	fs.StringVar(&cfg.Password, "password", "", "DB password")
 	fs.IntVar(&cfg.StatusPort, "status-port", 10080, "TiDB status port (pprof/metrics)")
-
 	fs.StringVar(&cfg.DB, "db", "analyze_profile", "Database name")
 	fs.StringVar(&cfg.Table, "table", "t_partitioned", "Table name")
+}
+
+func RegisterSetupFlags(fs *flag.FlagSet, cfg *Config) {
+	registerCommonFlags(fs, cfg)
 	fs.IntVar(&cfg.Partitions, "partitions", 256, "Number of HASH partitions")
 	fs.IntVar(&cfg.Rows, "rows", 10000000, "Number of rows to insert")
 	fs.IntVar(&cfg.Columns, "columns", 50, "Number of columns")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 	fs.IntVar(&cfg.InsertConcurrency, "insert-concurrency", 8, "Number of parallel partition inserters")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = random, printed for reproducibility)")
-
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
+}
+
+func RegisterProfileFlags(fs *flag.FlagSet, cfg *Config) {
+	registerCommonFlags(fs, cfg)
 	fs.StringVar(&cfg.Partition, "partition", "", "Comma-separated partition names to analyze (e.g. \"p0,p1\"); empty = all")
 	fs.StringVar(&cfg.AnalyzeColumns, "analyze-columns", "", "Column selection for ANALYZE: all, predicate, or comma-separated column list (e.g. \"c1,c2,c3\"); empty = server default")
 	fs.Var(&cfg.SetVariables, "set-variable", "Set a session+global variable before ANALYZE (e.g. \"tidb_enable_sample_based_global_stats=ON\"); repeatable")

@@ -31,9 +31,6 @@ type OutputConfig struct {
 	StatusPort int    `json:"status_port"`
 	DB         string `json:"db"`
 	Table      string `json:"table"`
-	Partitions int    `json:"partitions"`
-	Rows       int    `json:"rows"`
-	Columns    int    `json:"columns"`
 }
 
 type PartitionJobSummary struct {
@@ -88,8 +85,8 @@ func writeJSONResult(path string, result *ProfileResult) error {
 
 func printSummary(result *ProfileResult) {
 	fmt.Printf("\n=== ANALYZE TABLE Profile Results ===\n")
-	fmt.Printf("Table:      %s.%s (%d partitions)\n",
-		result.Config.DB, result.Config.Table, result.Config.Partitions)
+	fmt.Printf("Table:      %s.%s\n",
+		result.Config.DB, result.Config.Table)
 	fmt.Printf("Duration:   %s\n", result.AnalyzeDuration)
 	fmt.Println()
 
