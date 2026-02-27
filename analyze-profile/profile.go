@@ -72,11 +72,9 @@ func runProfile(cfg *Config) error {
 
 	// Drop stats if requested
 	if cfg.DropStats {
-		dropSQL := fmt.Sprintf("DROP STATS `%s`.`%s`", cfg.DB, cfg.Table)
-		if _, err := db.Exec(dropSQL); err != nil {
-			return fmt.Errorf("drop stats: %w", err)
+		if err := dropStats(db, cfg); err != nil {
+			return err
 		}
-		fmt.Fprintf(os.Stderr, "Dropped statistics for %s.%s\n", cfg.DB, cfg.Table)
 	}
 
 	// Capture session variables
@@ -195,6 +193,56 @@ func runProfile(cfg *Config) error {
 	// Print summary
 	printSummary(result)
 
+	return nil
+}
+
+const dropStatsBatchSize = 8
+
+func dropStats(db *sql.DB, cfg *Config) error {
+	fmt.Fprintf(os.Stderr, "Dropping statistics for %s.%s...", cfg.DB, cfg.Table)
+	dropStart := time.Now()
+
+	// Fetch partition names.
+	rows, err := db.Query(
+		"SELECT PARTITION_NAME FROM information_schema.partitions WHERE table_schema = ? AND table_name = ? AND PARTITION_NAME IS NOT NULL ORDER BY PARTITION_NAME",
+		cfg.DB, cfg.Table)
+	if err != nil {
+		fmt.Fprintln(os.Stderr)
+		return fmt.Errorf("drop stats: list partitions: %w", err)
+	}
+	var partitions []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			fmt.Fprintln(os.Stderr)
+			return fmt.Errorf("drop stats: scan partition: %w", err)
+		}
+		partitions = append(partitions, name)
+	}
+	rows.Close()
+
+	// Drop stats in batches of partitions to avoid OOM on large tables.
+	for i := 0; i < len(partitions); i += dropStatsBatchSize {
+		end := i + dropStatsBatchSize
+		if end > len(partitions) {
+			end = len(partitions)
+		}
+		batch := partitions[i:end]
+		dropSQL := fmt.Sprintf("DROP STATS `%s`.`%s` PARTITION %s", cfg.DB, cfg.Table, strings.Join(batch, ", "))
+		if _, err := db.Exec(dropSQL); err != nil {
+			fmt.Fprintln(os.Stderr)
+			return fmt.Errorf("drop stats partition %s: %w", strings.Join(batch, ","), err)
+		}
+	}
+
+	// Drop the global (non-partition) stats.
+	if _, err := db.Exec(fmt.Sprintf("DROP STATS `%s`.`%s`", cfg.DB, cfg.Table)); err != nil {
+		fmt.Fprintln(os.Stderr)
+		return fmt.Errorf("drop stats (global): %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, " done in %s (%d partitions)\n", time.Since(dropStart).Round(100*time.Millisecond), len(partitions))
 	return nil
 }
 
