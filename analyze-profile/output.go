@@ -42,7 +42,7 @@ type PartitionJobSummary struct {
 	StartTime     *string `json:"start_time"`
 	EndTime       *string `json:"end_time"`
 	Duration      string  `json:"duration,omitempty"`
-	Progress      string  `json:"progress"`
+	ProcessedRows string  `json:"processed_rows"`
 	FailReason    string  `json:"fail_reason,omitempty"`
 }
 
@@ -67,7 +67,7 @@ type AnalyzeStatusEntry struct {
 	State         string  `json:"state"`
 	StartTime     *string `json:"start_time"`
 	EndTime       *string `json:"end_time"`
-	Progress      string  `json:"progress"`
+	ProcessedRows string  `json:"processed_rows"`
 	FailReason    string  `json:"fail_reason"`
 }
 

@@ -16,17 +16,17 @@ import (
 
 // AnalyzeJobSnapshot represents one row from mysql.analyze_jobs at a point in time.
 type AnalyzeJobSnapshot struct {
-	PollTime     time.Time `json:"poll_time"`
-	JobID        int64     `json:"job_id"`
-	TableSchema  string    `json:"table_schema"`
-	TableName    string    `json:"table_name"`
-	PartitionName string   `json:"partition_name"`
-	JobInfo      string    `json:"job_info"`
-	State        string    `json:"state"`
-	StartTime    *string   `json:"start_time"`
-	EndTime      *string   `json:"end_time"`
-	Progress     string    `json:"progress"`
-	FailReason   string    `json:"fail_reason"`
+	PollTime      time.Time `json:"poll_time"`
+	ID            int64     `json:"id"`
+	TableSchema   string    `json:"table_schema"`
+	TableName     string    `json:"table_name"`
+	PartitionName string    `json:"partition_name"`
+	JobInfo       string    `json:"job_info"`
+	ProcessedRows int64     `json:"processed_rows"`
+	State         string    `json:"state"`
+	StartTime     *string   `json:"start_time"`
+	EndTime       *string   `json:"end_time"`
+	FailReason    string    `json:"fail_reason"`
 }
 
 // MetricSample is one snapshot of metrics at a point in time.
@@ -108,11 +108,11 @@ func (p *AnalyzeJobsPoller) Start() {
 }
 
 func (p *AnalyzeJobsPoller) poll() {
-	query := `SELECT job_id, table_schema, table_name, partition_name, job_info, state,
-		start_time, end_time, IFNULL(progress, ''), IFNULL(fail_reason, '')
+	query := `SELECT id, table_schema, table_name, partition_name, job_info,
+		processed_rows, state, start_time, end_time, IFNULL(fail_reason, '')
 		FROM mysql.analyze_jobs
 		WHERE table_schema = ? AND table_name = ?
-		ORDER BY job_id`
+		ORDER BY id`
 
 	rows, err := p.db.Query(query, p.cfg.DB, p.cfg.Table)
 	if err != nil {
@@ -125,9 +125,9 @@ func (p *AnalyzeJobsPoller) poll() {
 	for rows.Next() {
 		var snap AnalyzeJobSnapshot
 		snap.PollTime = now
-		if err := rows.Scan(&snap.JobID, &snap.TableSchema, &snap.TableName,
-			&snap.PartitionName, &snap.JobInfo, &snap.State,
-			&snap.StartTime, &snap.EndTime, &snap.Progress, &snap.FailReason); err != nil {
+		if err := rows.Scan(&snap.ID, &snap.TableSchema, &snap.TableName,
+			&snap.PartitionName, &snap.JobInfo, &snap.ProcessedRows,
+			&snap.State, &snap.StartTime, &snap.EndTime, &snap.FailReason); err != nil {
 			continue
 		}
 		p.mu.Lock()

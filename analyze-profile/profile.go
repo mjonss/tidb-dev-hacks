@@ -250,8 +250,8 @@ func captureAnalyzeStatus(db *sql.DB, cfg *Config) []AnalyzeStatusEntry {
 				if s != "" {
 					entry.EndTime = &s
 				}
-			case "processed_rows", "progress":
-				entry.Progress = s
+			case "processed_rows":
+				entry.ProcessedRows = s
 			case "fail_reason":
 				entry.FailReason = s
 			}
@@ -294,7 +294,7 @@ func buildPartitionJobs(status []AnalyzeStatusEntry) []PartitionJobSummary {
 			StartTime:     s.StartTime,
 			EndTime:       s.EndTime,
 			Duration:      dur,
-			Progress:      s.Progress,
+			ProcessedRows: s.ProcessedRows,
 			FailReason:    s.FailReason,
 		})
 	}
