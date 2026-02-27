@@ -93,6 +93,9 @@ func runSetup(cfg *Config) error {
 
 func buildCreateTable(cfg *Config) string {
 	tms := typeMappers()
+	if cfg.ColumnTypes == "int" {
+		tms = intTypeMappers()
+	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", cfg.Table))
@@ -136,6 +139,9 @@ func buildCreateTable(cfg *Config) string {
 
 func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 	tms := typeMappers()
+	if cfg.ColumnTypes == "int" {
+		tms = intTypeMappers()
+	}
 	dists := distributions()
 
 	// Compute per-partition row counts from weights

@@ -132,6 +132,12 @@ func typeMappers() []TypeMapper {
 	}
 }
 
+// intTypeMappers returns only the INT and BIGINT type mappers.
+func intTypeMappers() []TypeMapper {
+	all := typeMappers()
+	return all[:2]
+}
+
 // isStringType returns true if the type mapper produces string values.
 func isStringType(tm TypeMapper) bool {
 	return tm.TypeName == "CHAR(32)" || tm.TypeName == "VARCHAR(255)"

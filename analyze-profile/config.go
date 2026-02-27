@@ -31,6 +31,7 @@ type Config struct {
 	BatchSize         int
 	InsertConcurrency int
 	Seed              int64
+	ColumnTypes       string
 
 	PartitionProfile  string
 	Partition         string
@@ -113,6 +114,9 @@ func (c *Config) ValidateSetup() error {
 	if c.InsertConcurrency < 1 {
 		return fmt.Errorf("--insert-concurrency must be >= 1")
 	}
+	if c.ColumnTypes != "mixed" && c.ColumnTypes != "int" {
+		return fmt.Errorf("--column-types must be \"mixed\" or \"int\"")
+	}
 	if _, err := ParsePartitionProfile(c.PartitionProfile); err != nil {
 		return err
 	}
@@ -157,6 +161,7 @@ func RegisterSetupFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 	fs.IntVar(&cfg.InsertConcurrency, "insert-concurrency", 8, "Number of parallel partition inserters")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = random, printed for reproducibility)")
+	fs.StringVar(&cfg.ColumnTypes, "column-types", "mixed", "Column types: mixed (all types) or int (INT/BIGINT only)")
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
 }
 

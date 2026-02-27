@@ -34,7 +34,8 @@ go run ./analyze-profile setup [flags]
 | `--table` | t_partitioned | Table name |
 | `--partitions` | 256 | Number of HASH partitions |
 | `--rows` | 10000000 | Number of rows to insert |
-| `--columns` | 50 | Number of columns (cycles through INT, BIGINT, CHAR, VARCHAR, DECIMAL, FLOAT, DOUBLE, DATE, DATETIME, TIMESTAMP) |
+| `--columns` | 50 | Number of columns (cycles through the selected column types) |
+| `--column-types` | mixed | Column types: `mixed` (INT, BIGINT, CHAR, VARCHAR, DECIMAL, FLOAT, DOUBLE, DATE, DATETIME, TIMESTAMP) or `int` (INT, BIGINT only) |
 | `--batch-size` | 5000 | INSERT batch size |
 | `--insert-concurrency` | 8 | Number of parallel partition inserters |
 | `--seed` | 0 | Random seed for data generation (0 = random, printed for reproducibility) |
