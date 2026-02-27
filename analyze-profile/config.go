@@ -42,6 +42,7 @@ type Config struct {
 	TiKVStatusPort    int
 	TiDBLog           string
 	DropStats         bool
+	TruncateStats     bool
 }
 
 func (c *Config) DSN() string {
@@ -176,4 +177,5 @@ func RegisterProfileFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.TiKVStatusPort, "tikv-status-port", 20180, "TiKV status port (for metrics)")
 	fs.StringVar(&cfg.TiDBLog, "tidb-log", "", "Path to TiDB log file (auto-detected if empty)")
 	fs.BoolVar(&cfg.DropStats, "drop-stats", false, "Drop table statistics before running ANALYZE")
+	fs.BoolVar(&cfg.TruncateStats, "truncate-stats", false, "Truncate all mysql.stats_* tables before running ANALYZE (affects all tables in cluster)")
 }

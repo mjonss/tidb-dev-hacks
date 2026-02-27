@@ -70,8 +70,12 @@ func runProfile(cfg *Config) error {
 		return fmt.Errorf("table %s.%s not found — run 'setup' first", cfg.DB, cfg.Table)
 	}
 
-	// Drop stats if requested
-	if cfg.DropStats {
+	// Clear stats if requested
+	if cfg.TruncateStats {
+		if err := truncateStats(db); err != nil {
+			return err
+		}
+	} else if cfg.DropStats {
 		if err := dropStats(db, cfg); err != nil {
 			return err
 		}
@@ -193,6 +197,33 @@ func runProfile(cfg *Config) error {
 	// Print summary
 	printSummary(result)
 
+	return nil
+}
+
+var statsTables = []string{
+	"mysql.stats_meta",
+	"mysql.stats_meta_history",
+	"mysql.stats_histograms",
+	"mysql.stats_buckets",
+	"mysql.stats_topn",
+	"mysql.stats_fm_sketch",
+	"mysql.stats_extended",
+	"mysql.stats_feedback",
+	"mysql.stats_history",
+	"mysql.analyze_options",
+	"mysql.column_stats_usage",
+	"mysql.stats_table_data",
+}
+
+func truncateStats(db *sql.DB) error {
+	fmt.Fprintf(os.Stderr, "Truncating stats tables...")
+	truncStart := time.Now()
+	for _, table := range statsTables {
+		if _, err := db.Exec(fmt.Sprintf("TRUNCATE TABLE %s", table)); err != nil {
+			fmt.Fprintf(os.Stderr, " %s failed: %v (skipping)\n", table, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, " done in %s\n", time.Since(truncStart).Round(100*time.Millisecond))
 	return nil
 }
 
