@@ -70,6 +70,15 @@ func runProfile(cfg *Config) error {
 		return fmt.Errorf("table %s.%s not found — run 'setup' first", cfg.DB, cfg.Table)
 	}
 
+	// Drop stats if requested
+	if cfg.DropStats {
+		dropSQL := fmt.Sprintf("DROP STATS `%s`.`%s`", cfg.DB, cfg.Table)
+		if _, err := db.Exec(dropSQL); err != nil {
+			return fmt.Errorf("drop stats: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Dropped statistics for %s.%s\n", cfg.DB, cfg.Table)
+	}
+
 	// Capture session variables
 	sessionVars := captureSessionVars(db)
 	fmt.Fprintf(os.Stderr, "Captured %d session variables\n", len(sessionVars))

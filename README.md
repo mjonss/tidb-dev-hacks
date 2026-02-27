@@ -63,6 +63,7 @@ go run ./analyze-profile profile [flags]
 | `--cpu-profile-seconds` | 10 | Duration per pprof CPU profile capture |
 | `--tikv-status-port` | 20180 | TiKV status port (for metrics) |
 | `--tidb-log` | "" | Path to TiDB log file to tail during ANALYZE |
+| `--drop-stats` | false | Drop table statistics before running ANALYZE |
 
 Each run creates a timestamped subdirectory (e.g. `output/run_20260226_153045/`) containing:
 - `profile_result.json` — full structured results (config, per-partition jobs, metric time series, slow queries, session variables)

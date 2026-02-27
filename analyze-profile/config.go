@@ -41,6 +41,7 @@ type Config struct {
 	CPUProfileSeconds int
 	TiKVStatusPort    int
 	TiDBLog           string
+	DropStats         bool
 }
 
 func (c *Config) DSN() string {
@@ -174,4 +175,5 @@ func RegisterProfileFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.CPUProfileSeconds, "cpu-profile-seconds", 10, "Duration for pprof CPU profile")
 	fs.IntVar(&cfg.TiKVStatusPort, "tikv-status-port", 20180, "TiKV status port (for metrics)")
 	fs.StringVar(&cfg.TiDBLog, "tidb-log", "", "Path to TiDB log file (auto-detected if empty)")
+	fs.BoolVar(&cfg.DropStats, "drop-stats", false, "Drop table statistics before running ANALYZE")
 }
