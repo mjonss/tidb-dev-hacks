@@ -43,12 +43,12 @@ type Config struct {
 }
 
 func (c *Config) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&interpolateParams=true",
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&interpolateParams=true&loc=UTC&time_zone=%%27UTC%%27",
 		c.User, c.Password, net.JoinHostPort(c.Host, fmt.Sprintf("%d", c.Port)), c.DB)
 }
 
 func (c *Config) DSNNoDB() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/?parseTime=true&interpolateParams=true",
+	return fmt.Sprintf("%s:%s@tcp(%s)/?parseTime=true&interpolateParams=true&loc=UTC&time_zone=%%27UTC%%27",
 		c.User, c.Password, net.JoinHostPort(c.Host, fmt.Sprintf("%d", c.Port)))
 }
 

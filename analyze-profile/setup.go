@@ -45,9 +45,6 @@ func runSetup(cfg *Config) error {
 	if err := db.Ping(); err != nil {
 		return fmt.Errorf("ping: %w", err)
 	}
-	if _, err := db.Exec("SET time_zone = '+00:00'"); err != nil {
-		return fmt.Errorf("set time_zone: %w", err)
-	}
 	fmt.Fprintf(os.Stderr, "Connected to %s:%d\n", cfg.Host, cfg.Port)
 
 	// Create database
