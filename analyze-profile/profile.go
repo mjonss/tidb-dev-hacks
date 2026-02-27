@@ -135,6 +135,9 @@ func runProfile(cfg *Config) error {
 	// Capture "after" analyze status
 	analyzeStatus := captureAnalyzeStatus(db, cfg)
 
+	// Dump table statistics (non-fatal on error)
+	dumpTableStats(db, cfg, runDir)
+
 	// Build per-partition job summaries from the final analyze status
 	partitionJobs := buildPartitionJobs(analyzeStatus)
 
@@ -299,6 +302,77 @@ func buildPartitionJobs(status []AnalyzeStatusEntry) []PartitionJobSummary {
 		})
 	}
 	return jobs
+}
+
+func dumpTableStats(db *sql.DB, cfg *Config, runDir string) {
+	type sqlDump struct {
+		filename string
+		query    string
+	}
+
+	dumps := []sqlDump{
+		{"stats_topn.tsv", fmt.Sprintf("SHOW stats_topn WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)},
+		{"stats_histograms.tsv", fmt.Sprintf("SHOW stats_histograms WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)},
+		{"stats_buckets.tsv", fmt.Sprintf("SHOW stats_buckets WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)},
+		{"stats_meta.tsv", fmt.Sprintf("SHOW stats_meta WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)},
+	}
+
+	for _, d := range dumps {
+		if err := dumpQueryToTSV(db, d.query, fmt.Sprintf("%s/%s", runDir, d.filename)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: dump %s failed: %v\n", d.filename, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Wrote %s/%s\n", runDir, d.filename)
+		}
+	}
+
+	// HTTP stats dump
+	statsURL := fmt.Sprintf("%s/stats/dump/%s/%s", cfg.StatusURL(), cfg.DB, cfg.Table)
+	statsPath := fmt.Sprintf("%s/stats_dump.json", runDir)
+	if err := downloadFile(statsURL, statsPath, 60*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: stats dump from %s failed: %v\n", statsURL, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "Wrote %s\n", statsPath)
+	}
+}
+
+func dumpQueryToTSV(db *sql.DB, query, path string) error {
+	rows, err := db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Header
+	fmt.Fprintln(f, strings.Join(cols, "\t"))
+
+	// Rows
+	for rows.Next() {
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			continue
+		}
+		fields := make([]string, len(cols))
+		for i := range cols {
+			fields[i] = sqlValToString(vals[i])
+		}
+		fmt.Fprintln(f, strings.Join(fields, "\t"))
+	}
+	return nil
 }
 
 func querySlowQueries(db *sql.DB, cfg *Config, since time.Time) []SlowQueryEntry {
