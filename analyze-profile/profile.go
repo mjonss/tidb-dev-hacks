@@ -213,6 +213,7 @@ var statsTables = []string{
 	"mysql.analyze_options",
 	"mysql.column_stats_usage",
 	"mysql.stats_table_data",
+	"mysql.stats_global_merge_data",
 }
 
 func truncateStats(db *sql.DB) error {
