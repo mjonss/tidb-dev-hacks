@@ -72,7 +72,7 @@ func runProfile(cfg *Config) error {
 
 	// Clear stats if requested
 	if cfg.TruncateStats {
-		if err := truncateStats(db); err != nil {
+		if err := truncateStats(db, runDir); err != nil {
 			return err
 		}
 	} else if cfg.DropStats {
@@ -200,32 +200,54 @@ func runProfile(cfg *Config) error {
 	return nil
 }
 
-var statsTables = []string{
-	"mysql.stats_meta",
-	"mysql.stats_meta_history",
-	"mysql.stats_histograms",
-	"mysql.stats_buckets",
-	"mysql.stats_top_n",
-	"mysql.stats_fm_sketch",
-	"mysql.stats_extended",
-	"mysql.stats_feedback",
-	"mysql.stats_history",
-	"mysql.analyze_options",
-	"mysql.column_stats_usage",
-	"mysql.stats_table_data",
-	"mysql.stats_global_merge_data",
-	"mysql.stats_table_locked",
+type statsTableEntry struct {
+	name    string
+	summary string // GROUP BY query to dump before truncating; empty = just COUNT(*)
 }
 
-func truncateStats(db *sql.DB) error {
-	fmt.Fprintf(os.Stderr, "Truncating stats tables...")
+var statsTables = []statsTableEntry{
+	{"mysql.stats_meta", "SELECT table_id, count, modify_count, version FROM mysql.stats_meta"},
+	{"mysql.stats_meta_history", "SELECT table_id, count(*) FROM mysql.stats_meta_history GROUP BY 1"},
+	{"mysql.stats_histograms", "SELECT table_id, is_index, hist_id, count(*) FROM mysql.stats_histograms GROUP BY 1,2,3"},
+	{"mysql.stats_buckets", "SELECT table_id, is_index, hist_id, count(*) FROM mysql.stats_buckets GROUP BY 1,2,3"},
+	{"mysql.stats_top_n", "SELECT table_id, is_index, hist_id, count(*) FROM mysql.stats_top_n GROUP BY 1,2,3"},
+	{"mysql.stats_fm_sketch", "SELECT table_id, is_index, hist_id, count(*) FROM mysql.stats_fm_sketch GROUP BY 1,2,3"},
+	{"mysql.stats_extended", "SELECT table_id, count(*) FROM mysql.stats_extended GROUP BY 1"},
+	{"mysql.stats_feedback", "SELECT table_id, hist_id, is_index, count(*) FROM mysql.stats_feedback GROUP BY 1,2,3"},
+	{"mysql.stats_history", "SELECT table_id, count(*) FROM mysql.stats_history GROUP BY 1"},
+	{"mysql.analyze_options", "SELECT table_id, count(*) FROM mysql.analyze_options GROUP BY 1"},
+	{"mysql.column_stats_usage", "SELECT table_id, count(*) FROM mysql.column_stats_usage GROUP BY 1"},
+	{"mysql.stats_table_data", "SELECT table_id, count(*) FROM mysql.stats_table_data GROUP BY 1"},
+	{"mysql.stats_global_merge_data", "SELECT table_id, type, hist_id, count(*) FROM mysql.stats_global_merge_data GROUP BY 1,2,3"},
+	{"mysql.stats_table_locked", "SELECT table_id, count(*) FROM mysql.stats_table_locked GROUP BY 1"},
+}
+
+func truncateStats(db *sql.DB, runDir string) error {
+	fmt.Fprintf(os.Stderr, "Truncating stats tables...\n")
 	truncStart := time.Now()
-	for _, table := range statsTables {
-		if _, err := db.Exec(fmt.Sprintf("TRUNCATE TABLE %s", table)); err != nil {
-			fmt.Fprintf(os.Stderr, " %s failed: %v (skipping)\n", table, err)
+
+	// Dump summaries before truncating
+	dumpDir := fmt.Sprintf("%s/stats_before_truncate", runDir)
+	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+		return fmt.Errorf("create stats dump dir: %w", err)
+	}
+	for _, t := range statsTables {
+		// Strip "mysql." prefix for the filename
+		filename := strings.TrimPrefix(t.name, "mysql.") + "_summary.tsv"
+		path := fmt.Sprintf("%s/%s", dumpDir, filename)
+		if err := dumpQueryToTSV(db, t.summary, path); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s summary: %v (skipping)\n", t.name, err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, " done in %s\n", time.Since(truncStart).Round(100*time.Millisecond))
+	fmt.Fprintf(os.Stderr, "  Wrote summaries to %s\n", dumpDir)
+
+	// Truncate
+	for _, t := range statsTables {
+		if _, err := db.Exec(fmt.Sprintf("TRUNCATE TABLE %s", t.name)); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: %v (skipping)\n", t.name, err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  done in %s\n", time.Since(truncStart).Round(100*time.Millisecond))
 	return nil
 }
 
