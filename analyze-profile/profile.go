@@ -205,7 +205,7 @@ var statsTables = []string{
 	"mysql.stats_meta_history",
 	"mysql.stats_histograms",
 	"mysql.stats_buckets",
-	"mysql.stats_topn",
+	"mysql.stats_top_n",
 	"mysql.stats_fm_sketch",
 	"mysql.stats_extended",
 	"mysql.stats_feedback",
@@ -214,6 +214,7 @@ var statsTables = []string{
 	"mysql.column_stats_usage",
 	"mysql.stats_table_data",
 	"mysql.stats_global_merge_data",
+	"mysql.stats_table_locked",
 }
 
 func truncateStats(db *sql.DB) error {
