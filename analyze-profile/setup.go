@@ -56,10 +56,14 @@ func runSetup(cfg *Config) error {
 	}
 	fmt.Fprintf(os.Stderr, "Database: %s\n", cfg.DB)
 
-	// Switch to target database
-	if _, err := db.Exec(fmt.Sprintf("USE `%s`", cfg.DB)); err != nil {
-		return fmt.Errorf("use database: %w", err)
+	// Reconnect with the target database in the DSN so all pooled connections
+	// have the correct database selected (USE only affects a single connection).
+	db.Close()
+	db, err = sql.Open("mysql", cfg.DSN())
+	if err != nil {
+		return fmt.Errorf("reconnect: %w", err)
 	}
+	defer db.Close()
 
 	// Drop existing table
 	if _, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", cfg.Table)); err != nil {
