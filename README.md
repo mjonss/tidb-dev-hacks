@@ -39,7 +39,6 @@ go run ./analyze-profile setup [flags]
 | `--insert-concurrency` | 8 | Number of parallel partition inserters |
 | `--seed` | 0 | Random seed for data generation (0 = random, printed for reproducibility) |
 | `--partition-profile` | uniform | Data distribution across partitions: `uniform`, `range-like`, `size-skew` |
-| `--analyze-columns` | "" | Column selection for ANALYZE: `all`, `predicate`, or comma-separated list (e.g. `c1,c2,c3`); empty = server default |
 
 #### 2. Profile — run ANALYZE and collect data
 
@@ -47,13 +46,18 @@ go run ./analyze-profile setup [flags]
 go run ./analyze-profile profile [flags]
 ```
 
-All flags from `setup` apply, plus:
-
 | Flag | Default | Description |
 |---|---|---|
-| `--partition` | "" | Comma-separated partition names to analyze (e.g. `p0,p1`); empty = all partitions |
-| `--set-variable` | | Set a session+global variable before ANALYZE (repeatable, e.g. `--set-variable "tidb_enable_sample_based_global_stats=ON"`) |
+| `--host` | 127.0.0.1 | TiDB host |
+| `--port` | 4000 | TiDB SQL port |
+| `--user` | root | DB user |
+| `--password` | "" | DB password |
 | `--status-port` | 10080 | TiDB status port (pprof/metrics) |
+| `--db` | analyze_profile | Database name |
+| `--table` | t_partitioned | Table name |
+| `--partition` | "" | Comma-separated partition names to analyze (e.g. `p0,p1`); empty = all partitions |
+| `--analyze-columns` | "" | Column selection for ANALYZE: `all`, `predicate`, or comma-separated list (e.g. `c1,c2,c3`); empty = server default |
+| `--set-variable` | | Set a session+global variable before ANALYZE (repeatable, e.g. `--set-variable "tidb_enable_sample_based_global_stats=ON"`) |
 | `--output-dir` | ./output | Base directory for results |
 | `--cpu-profile-seconds` | 10 | Duration per pprof CPU profile capture |
 | `--tikv-status-port` | 20180 | TiKV status port (for metrics) |
@@ -61,7 +65,9 @@ All flags from `setup` apply, plus:
 
 Each run creates a timestamped subdirectory (e.g. `output/run_20260226_153045/`) containing:
 - `profile_result.json` — full structured results (config, per-partition jobs, metric time series, slow queries, session variables)
-- `heap_before.pb.gz` / `heap_after.pb.gz` — heap profiles
+- `stats_topn.tsv`, `stats_histograms.tsv`, `stats_buckets.tsv`, `stats_meta.tsv` — table statistics from SQL
+- `stats_dump.json` — full statistics dump from TiDB HTTP API
+- `heap_*.pb.gz` — heap profiles (snapshots during and after ANALYZE)
 - `cpu_profile_*.pb.gz` — CPU profiles (viewable with `go tool pprof`)
 
 #### Data collected during profiling
