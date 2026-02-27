@@ -201,8 +201,9 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 				n := totalInserted.Load()
 				elapsed := time.Since(startTime)
 				rate := float64(n) / elapsed.Seconds()
-				fmt.Fprintf(os.Stderr, "\r  Inserted %d/%d rows (%.0f rows/s)   ",
-					n, cfg.Rows, rate)
+				pct := float64(n) / float64(cfg.Rows) * 100
+				fmt.Fprintf(os.Stderr, "\r  Inserted %.1f%% %d/%d rows, %.0f rows/s   ",
+					pct, n, cfg.Rows, rate)
 			case <-done:
 				return
 			}
@@ -298,6 +299,6 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 	default:
 	}
 
-	fmt.Fprintf(os.Stderr, "\r  Inserted %d/%d rows (done)        \n", totalInserted.Load(), cfg.Rows)
+	fmt.Fprintf(os.Stderr, "\r  Inserted 100.0%% %d/%d rows (done)        \n", totalInserted.Load(), cfg.Rows)
 	return nil
 }
