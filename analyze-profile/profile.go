@@ -45,6 +45,19 @@ func runProfile(cfg *Config) error {
 	}
 	fmt.Fprintf(os.Stderr, "Connected to %s:%d\n", cfg.Host, cfg.Port)
 
+	// Save TiDB version
+	var tidbVersion string
+	if err := db.QueryRow("SELECT tidb_version()").Scan(&tidbVersion); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: tidb_version() failed: %v\n", err)
+	} else {
+		versionPath := fmt.Sprintf("%s/tidb_version.txt", runDir)
+		if err := os.WriteFile(versionPath, []byte(tidbVersion+"\n"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: write tidb_version.txt: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Wrote %s\n", versionPath)
+		}
+	}
+
 	// Set user-requested variables on both global and session level
 	for _, sv := range cfg.SetVariables {
 		parts := strings.SplitN(sv, "=", 2)
