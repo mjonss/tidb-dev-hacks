@@ -40,6 +40,8 @@ go run ./analyze-profile setup [flags]
 | `--insert-concurrency` | 8 | Number of parallel partition inserters |
 | `--seed` | 0 | Random seed for data generation (0 = random, printed for reproducibility) |
 | `--partition-profile` | uniform | Data distribution across partitions: `uniform`, `range-like`, `size-skew` |
+| `--index` | | Secondary index columns (repeatable, e.g. `--index "c1,c4" --index "c3"`); creates `KEY idx_c1_c4 (c1, c4)` etc. |
+| `--max-string-length` | 60 | Maximum length for generated VARCHAR values; if > 255, widens the column type to `VARCHAR(N)` |
 
 #### 2. Profile — run ANALYZE and collect data
 
@@ -65,6 +67,7 @@ go run ./analyze-profile profile [flags]
 | `--tidb-log` | "" | Path to TiDB log file to tail during ANALYZE |
 | `--drop-stats` | false | Drop table statistics before running ANALYZE |
 | `--truncate-stats` | false | Truncate all `mysql.stats_*` tables before running ANALYZE (affects all tables in cluster) |
+| `--check-accuracy` | false | After ANALYZE, compare stats estimates vs actual counts (row count + range queries on up to 5 columns) |
 
 Each run creates a timestamped subdirectory (e.g. `output/run_20260226_153045/`) containing:
 - `profile_result.json` — full structured results (config, per-partition jobs, metric time series, slow queries, session variables)
@@ -101,6 +104,13 @@ go run ./analyze-profile profile --partition "p0,p1"
 go run ./analyze-profile profile \
   --set-variable "tidb_enable_sample_based_global_stats=ON" \
   --set-variable "tidb_build_stats_concurrency=4"
+
+# Create a table with secondary indexes and long strings (for accuracy testing)
+go run ./analyze-profile setup --partitions=256 --rows=1000000 --columns=20 \
+  --index "c1,c4" --index "c1,c2,c3" --max-string-length 8000
+
+# Profile with accuracy checking (compares EXPLAIN estimates vs actual counts)
+go run ./analyze-profile profile --check-accuracy
 
 # View CPU profile
 go tool pprof output/run_*/cpu_profile_0.pb.gz
