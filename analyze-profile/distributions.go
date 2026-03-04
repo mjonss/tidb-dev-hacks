@@ -161,6 +161,20 @@ func isStringType(tm TypeMapper) bool {
 	return strings.HasPrefix(tm.TypeName, "CHAR") || strings.HasPrefix(tm.TypeName, "VARCHAR")
 }
 
+// distributionNames returns human-readable names for the 8 built-in distributions.
+func distributionNames() []string {
+	return []string{
+		"uniform",
+		"zipf",
+		"normal",
+		"low-ndv",
+		"sequential",
+		"per-part-range",
+		"growth",
+		"per-part-categ",
+	}
+}
+
 // isSequentialDist returns true for the Sequential distribution (index 4).
 func isSequentialDist(distIdx int) bool {
 	return distIdx == 4

@@ -74,6 +74,7 @@ func runSetup(cfg *Config) error {
 		return fmt.Errorf("create table: %w\nSQL: %s", err, createSQL)
 	}
 	fmt.Fprintf(os.Stderr, "Created table: %s (%d columns, %d partitions)\n", cfg.Table, cfg.Columns, cfg.Partitions)
+	printColumnLayout(cfg)
 
 	// Bulk insert
 	if err := bulkInsert(db, cfg, profile); err != nil {
@@ -325,4 +326,33 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 
 	fmt.Fprintf(os.Stderr, "\r  Inserted 100.0%% %d/%d rows (done)        \n", totalInserted.Load(), cfg.Rows)
 	return nil
+}
+
+// printColumnLayout prints the column name → type + distribution mapping.
+func printColumnLayout(cfg *Config) {
+	tms := typeMappers(cfg.MaxStringLength)
+	if cfg.ColumnTypes == "int" {
+		tms = intTypeMappers()
+	}
+	dists := distributionNames()
+
+	fmt.Fprintf(os.Stderr, "\nColumn layout:\n")
+	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", "Column", "Type", "Null", "Distribution")
+	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", "------", "----", "----", "------------")
+	for i := 0; i < cfg.Columns; i++ {
+		tm := tms[i%len(tms)]
+		colName := fmt.Sprintf("c%d", i+1)
+		cycle := i / len(tms)
+		nullable := "YES"
+		if cycle%2 == 1 {
+			nullable = "NO"
+		}
+		distIdx := i % len(dists)
+		distName := dists[distIdx]
+		if isSequentialDist(distIdx) && isStringType(tm) {
+			distName = "uniform*" // fallback
+		}
+		fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", colName, tm.TypeName, nullable, distName)
+	}
+	fmt.Fprintln(os.Stderr)
 }

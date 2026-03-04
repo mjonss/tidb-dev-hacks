@@ -43,6 +43,24 @@ go run ./analyze-profile setup [flags]
 | `--index` | | Secondary index columns (repeatable, e.g. `--index "c1,c4" --index "c3"`); creates `KEY idx_c1_c4 (c1, c4)` etc. |
 | `--max-string-length` | 60 | Maximum length for generated VARCHAR values; if > 255, widens the column type to `VARCHAR(N)` |
 
+**Column layout:** Columns cycle through types and distributions in order. The full mapping is printed during `setup`. With `--column-types mixed` (default):
+
+| Column | Type | Distribution |
+|--------|------|-------------|
+| c1 | INT | uniform |
+| c2 | BIGINT | zipf |
+| c3 | CHAR(32) | normal |
+| c4 | VARCHAR(255) | low-ndv |
+| c5 | DECIMAL(10,2) | sequential |
+| c6 | FLOAT | per-part-range |
+| c7 | DOUBLE | growth |
+| c8 | DATE | per-part-categ |
+| c9 | DATETIME | uniform |
+| c10 | TIMESTAMP | zipf |
+| c11+ | (cycle repeats) | (cycle repeats) |
+
+Use this to choose `--index` columns by type, e.g. `--index "c1,c4"` for a composite INT+VARCHAR index.
+
 #### 2. Profile — run ANALYZE and collect data
 
 ```sh
