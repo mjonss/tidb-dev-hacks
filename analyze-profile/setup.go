@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,14 +146,20 @@ func buildCreateTable(cfg *Config) string {
 	sb.WriteString("  PRIMARY KEY (`pk`)")
 
 	// Secondary indexes
+	// Supports prefix length syntax: "c4(100)" → KEY ... (`c4`(100))
 	for _, idxSpec := range cfg.Indexes {
 		cols := strings.Split(idxSpec, ",")
 		quotedCols := make([]string, len(cols))
 		nameParts := make([]string, len(cols))
 		for i, c := range cols {
 			c = strings.TrimSpace(c)
-			quotedCols[i] = fmt.Sprintf("`%s`", c)
-			nameParts[i] = c
+			colName, prefixLen := parseColPrefix(c)
+			if prefixLen > 0 {
+				quotedCols[i] = fmt.Sprintf("`%s`(%d)", colName, prefixLen)
+			} else {
+				quotedCols[i] = fmt.Sprintf("`%s`", colName)
+			}
+			nameParts[i] = colName
 		}
 		idxName := "idx_" + strings.Join(nameParts, "_")
 		sb.WriteString(fmt.Sprintf(",\n  KEY `%s` (%s)", idxName, strings.Join(quotedCols, ", ")))
@@ -326,6 +333,21 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 
 	fmt.Fprintf(os.Stderr, "\r  Inserted 100.0%% %d/%d rows (done)        \n", totalInserted.Load(), cfg.Rows)
 	return nil
+}
+
+// parseColPrefix splits "c4(100)" into ("c4", 100). Without prefix: ("c4", 0).
+func parseColPrefix(s string) (string, int) {
+	idx := strings.IndexByte(s, '(')
+	if idx < 0 {
+		return s, 0
+	}
+	colName := s[:idx]
+	lenStr := strings.TrimSuffix(s[idx+1:], ")")
+	n, err := strconv.Atoi(lenStr)
+	if err != nil || n <= 0 {
+		return colName, 0
+	}
+	return colName, n
 }
 
 // printColumnLayout prints the column name → type + distribution mapping.

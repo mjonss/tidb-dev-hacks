@@ -133,6 +133,10 @@ func (c *Config) ValidateSetup() error {
 			if col == "" {
 				return fmt.Errorf("--index: empty column name in %q", idxSpec)
 			}
+			// Strip optional prefix length: "c4(100)" → "c4"
+			if idx := strings.IndexByte(col, '('); idx > 0 {
+				col = col[:idx]
+			}
 			if col == "pk" {
 				continue
 			}
