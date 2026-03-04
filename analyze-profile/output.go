@@ -23,6 +23,7 @@ type ProfileResult struct {
 	SlowQueries      []SlowQueryEntry      `json:"slow_queries"`
 	PprofFiles       PprofFiles            `json:"pprof_files"`
 	AnalyzeStatus    []AnalyzeStatusEntry  `json:"analyze_status_after"`
+	Accuracy         *AccuracyResult       `json:"accuracy,omitempty"`
 }
 
 type OutputConfig struct {
@@ -187,6 +188,21 @@ func printSummary(result *ProfileResult) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			fmt.Printf("  %s = %s\n", k, result.SessionVars[k])
+		}
+		fmt.Println()
+	}
+
+	// Accuracy
+	if result.Accuracy != nil {
+		fmt.Println("--- Accuracy Check ---")
+		rc := result.Accuracy.RowCount
+		fmt.Printf("  Row count: stats=%d actual=%d ratio=%.4f\n", rc.StatsCount, rc.ActualCount, rc.Ratio)
+		if len(result.Accuracy.RangeEstimates) > 0 {
+			fmt.Printf("  Range estimates (%d checks):\n", len(result.Accuracy.RangeEstimates))
+			for _, re := range result.Accuracy.RangeEstimates {
+				fmt.Printf("    %s WHERE %s: est=%.0f actual=%d ratio=%.3f\n",
+					re.Column, re.Predicate, re.EstRows, re.ActualRows, re.Ratio)
+			}
 		}
 		fmt.Println()
 	}

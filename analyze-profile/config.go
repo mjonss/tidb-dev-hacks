@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +33,8 @@ type Config struct {
 	InsertConcurrency int
 	Seed              int64
 	ColumnTypes       string
+	Indexes           stringSlice
+	MaxStringLength   int
 
 	PartitionProfile  string
 	Partition         string
@@ -43,6 +46,7 @@ type Config struct {
 	TiDBLog           string
 	DropStats         bool
 	TruncateStats     bool
+	CheckAccuracy     bool
 }
 
 func (c *Config) DSN() string {
@@ -119,6 +123,28 @@ func (c *Config) ValidateSetup() error {
 	if c.ColumnTypes != "mixed" && c.ColumnTypes != "int" {
 		return fmt.Errorf("--column-types must be \"mixed\" or \"int\"")
 	}
+	if c.MaxStringLength < 1 {
+		return fmt.Errorf("--max-string-length must be >= 1")
+	}
+	for _, idxSpec := range c.Indexes {
+		cols := strings.Split(idxSpec, ",")
+		for _, col := range cols {
+			col = strings.TrimSpace(col)
+			if col == "" {
+				return fmt.Errorf("--index: empty column name in %q", idxSpec)
+			}
+			if col == "pk" {
+				continue
+			}
+			if !strings.HasPrefix(col, "c") {
+				return fmt.Errorf("--index: invalid column %q (expected c1, c2, ... or pk)", col)
+			}
+			num, err := strconv.Atoi(col[1:])
+			if err != nil || num < 1 || num > c.Columns {
+				return fmt.Errorf("--index: column %q out of range (c1-c%d)", col, c.Columns)
+			}
+		}
+	}
 	if _, err := ParsePartitionProfile(c.PartitionProfile); err != nil {
 		return err
 	}
@@ -164,6 +190,8 @@ func RegisterSetupFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.InsertConcurrency, "insert-concurrency", 8, "Number of parallel partition inserters")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = random, printed for reproducibility)")
 	fs.StringVar(&cfg.ColumnTypes, "column-types", "mixed", "Column types: mixed (all types) or int (INT/BIGINT only)")
+	fs.Var(&cfg.Indexes, "index", "Secondary index columns (e.g. \"c1,c4\"); repeatable for multiple indexes")
+	fs.IntVar(&cfg.MaxStringLength, "max-string-length", 60, "Maximum length for generated VARCHAR values (adjusts column type if > 255)")
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
 }
 
@@ -178,4 +206,5 @@ func RegisterProfileFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.TiDBLog, "tidb-log", "", "Path to TiDB log file (auto-detected if empty)")
 	fs.BoolVar(&cfg.DropStats, "drop-stats", false, "Drop table statistics before running ANALYZE")
 	fs.BoolVar(&cfg.TruncateStats, "truncate-stats", false, "Truncate all mysql.stats_* tables before running ANALYZE (affects all tables in cluster)")
+	fs.BoolVar(&cfg.CheckAccuracy, "check-accuracy", false, "After ANALYZE, compare stats estimates vs actual counts for range queries")
 }

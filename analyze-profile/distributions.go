@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 )
 
@@ -80,7 +81,24 @@ func distributions() []DistFunc {
 }
 
 // typeMappers returns the 10 type mappers that convert [0,1) to SQL literals.
-func typeMappers() []TypeMapper {
+// maxStringLen controls the maximum length of generated VARCHAR values.
+// If maxStringLen > 255, the VARCHAR column type is widened accordingly.
+func typeMappers(maxStringLen int) []TypeMapper {
+	if maxStringLen <= 0 {
+		maxStringLen = 60
+	}
+	varcharType := "VARCHAR(255)"
+	if maxStringLen > 255 {
+		varcharType = fmt.Sprintf("VARCHAR(%d)", maxStringLen)
+	}
+	// Minimum string length is 10 or maxStringLen (whichever is smaller)
+	minLen := 10
+	if minLen > maxStringLen {
+		minLen = maxStringLen
+	}
+	// The range for Intn: generate lengths from minLen to maxStringLen inclusive
+	lenRange := maxStringLen - minLen + 1
+
 	dateStart := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	dateEnd := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
 	dateDays := dateEnd.Sub(dateStart).Hours() / 24
@@ -103,9 +121,9 @@ func typeMappers() []TypeMapper {
 			localRng := rand.New(rand.NewSource(int64(v * float64(int64(1)<<53))))
 			return fmt.Sprintf("'%s'", randString(localRng, 32))
 		}},
-		{"VARCHAR(255)", func(v float64, _ *rand.Rand) string {
+		{varcharType, func(v float64, _ *rand.Rand) string {
 			localRng := rand.New(rand.NewSource(int64(v * float64(int64(1)<<53))))
-			length := 10 + localRng.Intn(50)
+			length := minLen + localRng.Intn(lenRange)
 			return fmt.Sprintf("'%s'", randString(localRng, length))
 		}},
 		{"DECIMAL(10,2)", func(v float64, _ *rand.Rand) string {
@@ -134,13 +152,13 @@ func typeMappers() []TypeMapper {
 
 // intTypeMappers returns only the INT and BIGINT type mappers.
 func intTypeMappers() []TypeMapper {
-	all := typeMappers()
+	all := typeMappers(60) // string length irrelevant for int-only
 	return all[:2]
 }
 
 // isStringType returns true if the type mapper produces string values.
 func isStringType(tm TypeMapper) bool {
-	return tm.TypeName == "CHAR(32)" || tm.TypeName == "VARCHAR(255)"
+	return strings.HasPrefix(tm.TypeName, "CHAR") || strings.HasPrefix(tm.TypeName, "VARCHAR")
 }
 
 // isSequentialDist returns true for the Sequential distribution (index 4).

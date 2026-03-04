@@ -168,6 +168,16 @@ func runProfile(cfg *Config) error {
 	// Query slow_query
 	slowQueries := querySlowQueries(db, cfg, startTime)
 
+	// Accuracy check (if requested and ANALYZE succeeded)
+	var accuracyResult *AccuracyResult
+	if cfg.CheckAccuracy && analyzeErr == nil {
+		var err error
+		accuracyResult, err = checkAccuracy(db, cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: accuracy check failed: %v\n", err)
+		}
+	}
+
 	// Gather log entries
 	var logEntries []LogEntry
 	if logTailer != nil {
@@ -198,6 +208,7 @@ func runProfile(cfg *Config) error {
 			CPUFiles:  pprofCollector.CPUFiles(),
 		},
 		AnalyzeStatus: analyzeStatus,
+		Accuracy:      accuracyResult,
 	}
 
 	// Write JSON

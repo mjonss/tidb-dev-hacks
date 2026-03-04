@@ -87,12 +87,21 @@ func runSetup(cfg *Config) error {
 	fmt.Printf("  Profile:    %s\n", cfg.PartitionProfile)
 	fmt.Printf("  Rows:       %d\n", cfg.Rows)
 	fmt.Printf("  Columns:    %d\n", cfg.Columns)
+	if len(cfg.Indexes) > 0 {
+		fmt.Printf("  Indexes:    %d secondary\n", len(cfg.Indexes))
+		for _, idx := range cfg.Indexes {
+			fmt.Printf("              KEY (%s)\n", idx)
+		}
+	}
+	if cfg.MaxStringLength != 60 {
+		fmt.Printf("  MaxStrLen:  %d\n", cfg.MaxStringLength)
+	}
 	fmt.Printf("  Elapsed:    %s\n", elapsed.Round(time.Millisecond))
 	return nil
 }
 
 func buildCreateTable(cfg *Config) string {
-	tms := typeMappers()
+	tms := typeMappers(cfg.MaxStringLength)
 	if cfg.ColumnTypes == "int" {
 		tms = intTypeMappers()
 	}
@@ -132,13 +141,28 @@ func buildCreateTable(cfg *Config) string {
 		sb.WriteString(",\n")
 	}
 
-	sb.WriteString("  PRIMARY KEY (`pk`)\n")
-	sb.WriteString(fmt.Sprintf(") PARTITION BY HASH (`pk`) PARTITIONS %d", cfg.Partitions))
+	sb.WriteString("  PRIMARY KEY (`pk`)")
+
+	// Secondary indexes
+	for _, idxSpec := range cfg.Indexes {
+		cols := strings.Split(idxSpec, ",")
+		quotedCols := make([]string, len(cols))
+		nameParts := make([]string, len(cols))
+		for i, c := range cols {
+			c = strings.TrimSpace(c)
+			quotedCols[i] = fmt.Sprintf("`%s`", c)
+			nameParts[i] = c
+		}
+		idxName := "idx_" + strings.Join(nameParts, "_")
+		sb.WriteString(fmt.Sprintf(",\n  KEY `%s` (%s)", idxName, strings.Join(quotedCols, ", ")))
+	}
+
+	sb.WriteString(fmt.Sprintf("\n) PARTITION BY HASH (`pk`) PARTITIONS %d", cfg.Partitions))
 	return sb.String()
 }
 
 func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
-	tms := typeMappers()
+	tms := typeMappers(cfg.MaxStringLength)
 	if cfg.ColumnTypes == "int" {
 		tms = intTypeMappers()
 	}
