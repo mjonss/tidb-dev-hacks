@@ -145,21 +145,118 @@ func buildCreateTable(cfg *Config) string {
 
 	sb.WriteString("  PRIMARY KEY (`pk`)")
 
+	// Build column name → index key byte size map for auto-prefix calculation.
+	// TiDB uses utf8mb4 (4 bytes/char). Max index key = 3072 bytes.
+	const maxIndexKeyBytes = 3072
+	colKeyBytes := make(map[string]int)
+	colKeyBytes["pk"] = 8 // BIGINT = 8 bytes
+	for i := 0; i < cfg.Columns; i++ {
+		tm := tms[i%len(tms)]
+		name := fmt.Sprintf("c%d", i+1)
+		colKeyBytes[name] = indexKeyBytes(tm.TypeName)
+	}
+
 	// Secondary indexes
-	// Supports prefix length syntax: "c4(100)" → KEY ... (`c4`(100))
+	// Supports explicit prefix: "c4(100)" → KEY ... (`c4`(100))
+	// Auto-adds prefix when index key would exceed 3072 bytes.
 	for _, idxSpec := range cfg.Indexes {
 		cols := strings.Split(idxSpec, ",")
-		quotedCols := make([]string, len(cols))
-		nameParts := make([]string, len(cols))
+
+		// Parse columns and any explicit prefix lengths.
+		type idxCol struct {
+			name      string
+			prefixLen int // 0 = no explicit prefix
+			keyBytes  int // actual key bytes (may be capped)
+		}
+		idxCols := make([]idxCol, len(cols))
 		for i, c := range cols {
 			c = strings.TrimSpace(c)
-			colName, prefixLen := parseColPrefix(c)
-			if prefixLen > 0 {
-				quotedCols[i] = fmt.Sprintf("`%s`(%d)", colName, prefixLen)
-			} else {
-				quotedCols[i] = fmt.Sprintf("`%s`", colName)
+			name, plen := parseColPrefix(c)
+			kb := colKeyBytes[name]
+			if plen > 0 {
+				kb = plen * 4 // explicit prefix in chars → bytes
 			}
-			nameParts[i] = colName
+			idxCols[i] = idxCol{name: name, prefixLen: plen, keyBytes: kb}
+		}
+
+		// Check total key size; if over limit, auto-add prefix to string columns.
+		totalBytes := 0
+		for _, ic := range idxCols {
+			totalBytes += ic.keyBytes
+		}
+		if totalBytes > maxIndexKeyBytes {
+			// Shrink string columns (largest first) until under limit.
+			for totalBytes > maxIndexKeyBytes {
+				// Find the string column with the largest keyBytes and no explicit prefix.
+				best := -1
+				for i, ic := range idxCols {
+					if ic.prefixLen > 0 {
+						continue // user set explicit prefix, don't touch
+					}
+					typeName := ""
+					if ic.name != "pk" {
+						colIdx, _ := strconv.Atoi(ic.name[1:])
+						typeName = tms[(colIdx-1)%len(tms)].TypeName
+					}
+					if !strings.HasPrefix(typeName, "VARCHAR") && !strings.HasPrefix(typeName, "CHAR") {
+						continue
+					}
+					if best < 0 || ic.keyBytes > idxCols[best].keyBytes {
+						best = i
+					}
+				}
+				if best < 0 {
+					break // no string columns left to shrink
+				}
+				// Budget for this column: total budget minus all other columns.
+				othersBytes := 0
+				for i, ic := range idxCols {
+					if i != best {
+						othersBytes += ic.keyBytes
+					}
+				}
+				budgetBytes := maxIndexKeyBytes - othersBytes
+				if budgetBytes < 4 {
+					budgetBytes = 4 // minimum 1 char
+				}
+				prefixChars := budgetBytes / 4
+				idxCols[best].prefixLen = prefixChars
+				idxCols[best].keyBytes = prefixChars * 4
+				totalBytes = 0
+				for _, ic := range idxCols {
+					totalBytes += ic.keyBytes
+				}
+			}
+			// Print info about auto-prefixed columns.
+			for _, ic := range idxCols {
+				if ic.prefixLen > 0 {
+					// Check if it was auto-set (not in the original spec).
+					origCol := ""
+					for _, c := range cols {
+						c = strings.TrimSpace(c)
+						n, _ := parseColPrefix(c)
+						if n == ic.name {
+							origCol = c
+							break
+						}
+					}
+					if !strings.Contains(origCol, "(") {
+						fmt.Fprintf(os.Stderr, "  Auto-prefix: index column %s → %s(%d) (key would exceed %d bytes)\n",
+							ic.name, ic.name, ic.prefixLen, maxIndexKeyBytes)
+					}
+				}
+			}
+		}
+
+		quotedCols := make([]string, len(idxCols))
+		nameParts := make([]string, len(idxCols))
+		for i, ic := range idxCols {
+			if ic.prefixLen > 0 {
+				quotedCols[i] = fmt.Sprintf("`%s`(%d)", ic.name, ic.prefixLen)
+			} else {
+				quotedCols[i] = fmt.Sprintf("`%s`", ic.name)
+			}
+			nameParts[i] = ic.name
 		}
 		idxName := "idx_" + strings.Join(nameParts, "_")
 		sb.WriteString(fmt.Sprintf(",\n  KEY `%s` (%s)", idxName, strings.Join(quotedCols, ", ")))
@@ -333,6 +430,50 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 
 	fmt.Fprintf(os.Stderr, "\r  Inserted 100.0%% %d/%d rows (done)        \n", totalInserted.Load(), cfg.Rows)
 	return nil
+}
+
+// indexKeyBytes returns the index key size in bytes for a column type (utf8mb4).
+func indexKeyBytes(typeName string) int {
+	switch {
+	case typeName == "INT":
+		return 4
+	case typeName == "BIGINT":
+		return 8
+	case strings.HasPrefix(typeName, "CHAR"):
+		// CHAR(N) → N * 4 bytes (utf8mb4)
+		return extractTypeLen(typeName) * 4
+	case strings.HasPrefix(typeName, "VARCHAR"):
+		// VARCHAR(N) → N * 4 + 2 bytes length prefix
+		return extractTypeLen(typeName)*4 + 2
+	case strings.HasPrefix(typeName, "DECIMAL"):
+		return 8 // conservative
+	case typeName == "FLOAT":
+		return 4
+	case typeName == "DOUBLE":
+		return 8
+	case typeName == "DATE":
+		return 3
+	case typeName == "DATETIME":
+		return 8
+	case typeName == "TIMESTAMP":
+		return 4
+	default:
+		return 8
+	}
+}
+
+// extractTypeLen extracts N from type names like "VARCHAR(255)" or "CHAR(32)".
+func extractTypeLen(typeName string) int {
+	start := strings.IndexByte(typeName, '(')
+	end := strings.IndexByte(typeName, ')')
+	if start < 0 || end < 0 || end <= start {
+		return 0
+	}
+	n, err := strconv.Atoi(typeName[start+1 : end])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // parseColPrefix splits "c4(100)" into ("c4", 100). Without prefix: ("c4", 0).
