@@ -49,6 +49,12 @@ type BucketEntry struct {
 	NDV        int64  `json:"ndv"`
 }
 
+// histIDKey identifies a column or index by its internal TiDB hist_id.
+type histIDKey struct {
+	histID  int64
+	isIndex bool
+}
+
 // checkAccuracy extracts stats data (row counts, NDVs, TopN, histograms)
 // for comparison between runs and against non-partitioned ground truth.
 func checkAccuracy(db *sql.DB, cfg *Config) (*AccuracyResult, error) {
@@ -72,15 +78,19 @@ func checkAccuracy(db *sql.DB, cfg *Config) (*AccuracyResult, error) {
 		fmt.Fprintf(os.Stderr, "  Table is not partitioned — extracting all stats\n")
 	}
 
-	// 3. Extract column and index stats from SHOW STATS_HISTOGRAMS
-	columnStats, indexStats := extractHistogramStats(db, cfg, partFilter)
+	// 3. Prepare raw-table fallback metadata (table_id + hist_id→name mapping)
+	tableID, _ := getTableID(db, cfg)
+	histMap := buildHistIDNameMap(db, cfg)
+
+	// 4. Extract column and index stats from SHOW STATS_HISTOGRAMS (fallback: mysql.stats_histograms)
+	columnStats, indexStats := extractHistogramStats(db, cfg, partFilter, tableID, histMap)
 	fmt.Fprintf(os.Stderr, "  Extracted %d column stats, %d index stats\n", len(columnStats), len(indexStats))
 
-	// 4. Attach TopN entries
-	attachTopN(db, cfg, partFilter, columnStats, indexStats)
+	// 5. Attach TopN entries (fallback: mysql.stats_top_n)
+	attachTopN(db, cfg, partFilter, tableID, histMap, columnStats, indexStats)
 
-	// 5. Attach histogram buckets
-	attachBuckets(db, cfg, partFilter, columnStats, indexStats)
+	// 6. Attach histogram buckets (fallback: mysql.stats_buckets)
+	attachBuckets(db, cfg, partFilter, tableID, histMap, columnStats, indexStats)
 
 	// Flatten maps to slices
 	for _, s := range columnStats {
@@ -93,6 +103,10 @@ func checkAccuracy(db *sql.DB, cfg *Config) (*AccuracyResult, error) {
 	fmt.Fprintf(os.Stderr, "  Stats extraction completed in %s\n", time.Since(start).Round(time.Millisecond))
 	return result, nil
 }
+
+// ---------------------------------------------------------------------------
+// Row count check
+// ---------------------------------------------------------------------------
 
 func checkRowCount(db *sql.DB, cfg *Config) RowCountCheck {
 	tableFQN := fmt.Sprintf("`%s`.`%s`", cfg.DB, cfg.Table)
@@ -139,6 +153,10 @@ func checkRowCount(db *sql.DB, cfg *Config) RowCountCheck {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Table metadata helpers
+// ---------------------------------------------------------------------------
+
 func tableIsPartitioned(db *sql.DB, cfg *Config) bool {
 	var count int
 	err := db.QueryRow(`
@@ -151,12 +169,86 @@ func tableIsPartitioned(db *sql.DB, cfg *Config) bool {
 	return count > 0
 }
 
-// extractHistogramStats queries SHOW STATS_HISTOGRAMS and returns maps
-// keyed by column/index name for columns (is_index=0) and indexes (is_index=1).
-func extractHistogramStats(db *sql.DB, cfg *Config, partFilter string) (columns, indexes map[string]*StatsEntry) {
-	columns = make(map[string]*StatsEntry)
-	indexes = make(map[string]*StatsEntry)
+// getTableID returns the base table_id (TIDB_TABLE_ID) used in stats tables
+// for global stats of partitioned tables or the only ID for non-partitioned tables.
+func getTableID(db *sql.DB, cfg *Config) (int64, error) {
+	var id int64
+	err := db.QueryRow(`
+		SELECT TIDB_TABLE_ID FROM information_schema.tables
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+		cfg.DB, cfg.Table).Scan(&id)
+	return id, err
+}
 
+// buildHistIDNameMap builds a mapping from (hist_id, is_index) to column/index name.
+// For columns, hist_id == column_id which equals ordinal_position for freshly created tables.
+// For indexes, uses information_schema.tidb_indexes INDEX_ID field.
+func buildHistIDNameMap(db *sql.DB, cfg *Config) map[histIDKey]string {
+	m := make(map[histIDKey]string)
+
+	// Columns: ordinal_position → column_name
+	rows, err := db.Query(`
+		SELECT ORDINAL_POSITION, COLUMN_NAME
+		FROM information_schema.columns
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		ORDER BY ORDINAL_POSITION`, cfg.DB, cfg.Table)
+	if err == nil {
+		for rows.Next() {
+			var pos int64
+			var name string
+			if rows.Scan(&pos, &name) == nil {
+				m[histIDKey{pos, false}] = name
+			}
+		}
+		rows.Close()
+	}
+
+	// Indexes: try tidb_indexes for INDEX_ID (TiDB-specific)
+	rows, err = db.Query(`
+		SELECT KEY_NAME, INDEX_ID
+		FROM information_schema.tidb_indexes
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND SEQ_IN_INDEX = 1`,
+		cfg.DB, cfg.Table)
+	if err == nil {
+		for rows.Next() {
+			var name string
+			var id int64
+			if rows.Scan(&name, &id) == nil {
+				m[histIDKey{id, true}] = name
+			}
+		}
+		rows.Close()
+	}
+
+	return m
+}
+
+// resolveHistName looks up a hist_id in the mapping, falling back to a synthetic name.
+func resolveHistName(histMap map[histIDKey]string, histID int64, isIndex bool) string {
+	if name, ok := histMap[histIDKey{histID, isIndex}]; ok {
+		return name
+	}
+	if isIndex {
+		return fmt.Sprintf("idx_%d", histID)
+	}
+	return fmt.Sprintf("col_%d", histID)
+}
+
+// ---------------------------------------------------------------------------
+// Histogram stats extraction (NDV, NullCount, AvgColSize, Correlation)
+// ---------------------------------------------------------------------------
+
+func extractHistogramStats(db *sql.DB, cfg *Config, partFilter string, tableID int64, histMap map[histIDKey]string) (columns, indexes map[string]*StatsEntry) {
+	columns, indexes = showHistogramStats(db, cfg, partFilter)
+	if columns != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  Falling back to mysql.stats_histograms\n")
+	return rawHistogramStats(db, tableID, histMap)
+}
+
+// showHistogramStats queries SHOW STATS_HISTOGRAMS.
+func showHistogramStats(db *sql.DB, cfg *Config, partFilter string) (columns, indexes map[string]*StatsEntry) {
 	query := fmt.Sprintf("SHOW STATS_HISTOGRAMS WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)
 	if partFilter != "" {
 		query += fmt.Sprintf(" AND partition_name = '%s'", partFilter)
@@ -165,16 +257,18 @@ func extractHistogramStats(db *sql.DB, cfg *Config, partFilter string) (columns,
 	rows, err := db.Query(query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  SHOW STATS_HISTOGRAMS failed: %v\n", err)
-		return
+		return nil, nil
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return
+		return nil, nil
 	}
 
-	// Build column index map
+	columns = make(map[string]*StatsEntry)
+	indexes = make(map[string]*StatsEntry)
+
 	colIdx := make(map[string]int)
 	for i, c := range cols {
 		colIdx[c] = i
@@ -197,13 +291,11 @@ func extractHistogramStats(db *sql.DB, cfg *Config, partFilter string) (columns,
 			return ""
 		}
 		getInt := func(name string) int64 {
-			s := getStr(name)
-			v, _ := strconv.ParseInt(s, 10, 64)
+			v, _ := strconv.ParseInt(getStr(name), 10, 64)
 			return v
 		}
 		getFloat := func(name string) float64 {
-			s := getStr(name)
-			v, _ := strconv.ParseFloat(s, 64)
+			v, _ := strconv.ParseFloat(getStr(name), 64)
 			return v
 		}
 
@@ -227,8 +319,61 @@ func extractHistogramStats(db *sql.DB, cfg *Config, partFilter string) (columns,
 	return
 }
 
-// attachTopN queries SHOW STATS_TOPN and attaches TopN entries to the stats maps.
-func attachTopN(db *sql.DB, cfg *Config, partFilter string, columns, indexes map[string]*StatsEntry) {
+// rawHistogramStats queries mysql.stats_histograms directly.
+func rawHistogramStats(db *sql.DB, tableID int64, histMap map[histIDKey]string) (columns, indexes map[string]*StatsEntry) {
+	columns = make(map[string]*StatsEntry)
+	indexes = make(map[string]*StatsEntry)
+
+	rows, err := db.Query(`
+		SELECT hist_id, is_index, distinct_count, null_count, tot_col_size, correlation
+		FROM mysql.stats_histograms
+		WHERE table_id = ?`, tableID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  mysql.stats_histograms query failed: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var histID, ndv, nullCount, totColSize int64
+		var isIndex int
+		var correlation float64
+		if err := rows.Scan(&histID, &isIndex, &ndv, &nullCount, &totColSize, &correlation); err != nil {
+			continue
+		}
+
+		name := resolveHistName(histMap, histID, isIndex == 1)
+		entry := &StatsEntry{
+			Name:        name,
+			NDV:         ndv,
+			NullCount:   nullCount,
+			AvgColSize:  float64(totColSize), // raw total, not per-row average
+			Correlation: correlation,
+		}
+
+		if isIndex == 1 {
+			indexes[name] = entry
+		} else {
+			columns[name] = entry
+		}
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// TopN extraction
+// ---------------------------------------------------------------------------
+
+func attachTopN(db *sql.DB, cfg *Config, partFilter string, tableID int64, histMap map[histIDKey]string, columns, indexes map[string]*StatsEntry) {
+	ok := showTopN(db, cfg, partFilter, columns, indexes)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "  Falling back to mysql.stats_top_n\n")
+		rawTopN(db, tableID, histMap, columns, indexes)
+	}
+}
+
+// showTopN queries SHOW STATS_TOPN. Returns true on success.
+func showTopN(db *sql.DB, cfg *Config, partFilter string, columns, indexes map[string]*StatsEntry) bool {
 	query := fmt.Sprintf("SHOW STATS_TOPN WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)
 	if partFilter != "" {
 		query += fmt.Sprintf(" AND partition_name = '%s'", partFilter)
@@ -237,13 +382,13 @@ func attachTopN(db *sql.DB, cfg *Config, partFilter string, columns, indexes map
 	rows, err := db.Query(query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  SHOW STATS_TOPN failed: %v\n", err)
-		return
+		return false
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return
+		return false
 	}
 
 	colIdx := make(map[string]int)
@@ -251,7 +396,7 @@ func attachTopN(db *sql.DB, cfg *Config, partFilter string, columns, indexes map
 		colIdx[c] = i
 	}
 
-	totalTopN := 0
+	total := 0
 	for rows.Next() {
 		vals := make([]interface{}, len(cols))
 		ptrs := make([]interface{}, len(cols))
@@ -272,28 +417,80 @@ func attachTopN(db *sql.DB, cfg *Config, partFilter string, columns, indexes map
 		colName := getStr("Column_name")
 		isIndex := getStr("Is_index")
 		value := getStr("Value")
-		countStr := getStr("Count")
-		count, _ := strconv.ParseInt(countStr, 10, 64)
+		count, _ := strconv.ParseInt(getStr("Count"), 10, 64)
 
 		entry := TopNEntry{Value: value, Count: count}
-
 		if isIndex == "1" {
 			if s, ok := indexes[colName]; ok {
 				s.TopN = append(s.TopN, entry)
-				totalTopN++
+				total++
 			}
 		} else {
 			if s, ok := columns[colName]; ok {
 				s.TopN = append(s.TopN, entry)
-				totalTopN++
+				total++
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  Extracted %d TopN entries\n", totalTopN)
+	fmt.Fprintf(os.Stderr, "  Extracted %d TopN entries\n", total)
+	return true
 }
 
-// attachBuckets queries SHOW STATS_BUCKETS and attaches bucket entries to the stats maps.
-func attachBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes map[string]*StatsEntry) {
+// rawTopN queries mysql.stats_top_n directly. Values are HEX-encoded since
+// the raw table stores them as binary BLOBs.
+func rawTopN(db *sql.DB, tableID int64, histMap map[histIDKey]string, columns, indexes map[string]*StatsEntry) {
+	rows, err := db.Query(`
+		SELECT hist_id, is_index, HEX(value), count
+		FROM mysql.stats_top_n
+		WHERE table_id = ?
+		ORDER BY hist_id, is_index, count DESC`, tableID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  mysql.stats_top_n query failed: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	total := 0
+	for rows.Next() {
+		var histID, count int64
+		var isIndex int
+		var value string
+		if err := rows.Scan(&histID, &isIndex, &value, &count); err != nil {
+			continue
+		}
+
+		name := resolveHistName(histMap, histID, isIndex == 1)
+		entry := TopNEntry{Value: value, Count: count}
+
+		if isIndex == 1 {
+			if s, ok := indexes[name]; ok {
+				s.TopN = append(s.TopN, entry)
+				total++
+			}
+		} else {
+			if s, ok := columns[name]; ok {
+				s.TopN = append(s.TopN, entry)
+				total++
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  Extracted %d TopN entries (raw, HEX-encoded values)\n", total)
+}
+
+// ---------------------------------------------------------------------------
+// Bucket extraction
+// ---------------------------------------------------------------------------
+
+func attachBuckets(db *sql.DB, cfg *Config, partFilter string, tableID int64, histMap map[histIDKey]string, columns, indexes map[string]*StatsEntry) {
+	ok := showBuckets(db, cfg, partFilter, columns, indexes)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "  Falling back to mysql.stats_buckets\n")
+		rawBuckets(db, tableID, histMap, columns, indexes)
+	}
+}
+
+// showBuckets queries SHOW STATS_BUCKETS. Returns true on success.
+func showBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes map[string]*StatsEntry) bool {
 	query := fmt.Sprintf("SHOW STATS_BUCKETS WHERE db_name = '%s' AND table_name = '%s'", cfg.DB, cfg.Table)
 	if partFilter != "" {
 		query += fmt.Sprintf(" AND partition_name = '%s'", partFilter)
@@ -302,13 +499,13 @@ func attachBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes 
 	rows, err := db.Query(query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  SHOW STATS_BUCKETS failed: %v\n", err)
-		return
+		return false
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return
+		return false
 	}
 
 	colIdx := make(map[string]int)
@@ -316,7 +513,7 @@ func attachBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes 
 		colIdx[c] = i
 	}
 
-	totalBuckets := 0
+	total := 0
 	for rows.Next() {
 		vals := make([]interface{}, len(cols))
 		ptrs := make([]interface{}, len(cols))
@@ -334,8 +531,7 @@ func attachBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes 
 			return ""
 		}
 		getInt := func(name string) int64 {
-			s := getStr(name)
-			v, _ := strconv.ParseInt(s, 10, 64)
+			v, _ := strconv.ParseInt(getStr(name), 10, 64)
 			return v
 		}
 
@@ -354,14 +550,64 @@ func attachBuckets(db *sql.DB, cfg *Config, partFilter string, columns, indexes 
 		if isIndex == "1" {
 			if s, ok := indexes[colName]; ok {
 				s.Buckets = append(s.Buckets, entry)
-				totalBuckets++
+				total++
 			}
 		} else {
 			if s, ok := columns[colName]; ok {
 				s.Buckets = append(s.Buckets, entry)
-				totalBuckets++
+				total++
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  Extracted %d histogram buckets\n", totalBuckets)
+	fmt.Fprintf(os.Stderr, "  Extracted %d histogram buckets\n", total)
+	return true
+}
+
+// rawBuckets queries mysql.stats_buckets directly. Bounds are HEX-encoded
+// since the raw table stores them as binary BLOBs.
+func rawBuckets(db *sql.DB, tableID int64, histMap map[histIDKey]string, columns, indexes map[string]*StatsEntry) {
+	rows, err := db.Query(`
+		SELECT hist_id, is_index, bucket_id, count, repeats,
+			HEX(lower_bound), HEX(upper_bound), ndv
+		FROM mysql.stats_buckets
+		WHERE table_id = ?
+		ORDER BY hist_id, is_index, bucket_id`, tableID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  mysql.stats_buckets query failed: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	total := 0
+	for rows.Next() {
+		var histID, bucketID, count, repeats, ndv int64
+		var isIndex int
+		var lowerBound, upperBound string
+		if err := rows.Scan(&histID, &isIndex, &bucketID, &count, &repeats, &lowerBound, &upperBound, &ndv); err != nil {
+			continue
+		}
+
+		name := resolveHistName(histMap, histID, isIndex == 1)
+		entry := BucketEntry{
+			BucketID:   bucketID,
+			Count:      count,
+			Repeats:    repeats,
+			LowerBound: lowerBound,
+			UpperBound: upperBound,
+			NDV:        ndv,
+		}
+
+		if isIndex == 1 {
+			if s, ok := indexes[name]; ok {
+				s.Buckets = append(s.Buckets, entry)
+				total++
+			}
+		} else {
+			if s, ok := columns[name]; ok {
+				s.Buckets = append(s.Buckets, entry)
+				total++
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  Extracted %d histogram buckets (raw, HEX-encoded bounds)\n", total)
 }
