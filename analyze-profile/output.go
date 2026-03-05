@@ -192,16 +192,23 @@ func printSummary(result *ProfileResult) {
 		fmt.Println()
 	}
 
-	// Accuracy
+	// Stats extraction
 	if result.Accuracy != nil {
-		fmt.Println("--- Accuracy Check ---")
+		fmt.Println("--- Stats Extraction ---")
 		rc := result.Accuracy.RowCount
 		fmt.Printf("  Row count: stats=%d actual=%d ratio=%.4f\n", rc.StatsCount, rc.ActualCount, rc.Ratio)
-		if len(result.Accuracy.RangeEstimates) > 0 {
-			fmt.Printf("  Range estimates (%d checks):\n", len(result.Accuracy.RangeEstimates))
-			for _, re := range result.Accuracy.RangeEstimates {
-				fmt.Printf("    %s WHERE %s: est=%.0f actual=%d ratio=%.3f\n",
-					re.Column, re.Predicate, re.EstRows, re.ActualRows, re.Ratio)
+		if len(result.Accuracy.ColumnStats) > 0 {
+			fmt.Printf("  Column stats (%d columns):\n", len(result.Accuracy.ColumnStats))
+			for _, cs := range result.Accuracy.ColumnStats {
+				fmt.Printf("    %-20s NDV=%-10d NullCount=%-8d TopN=%d Buckets=%d\n",
+					cs.Name, cs.NDV, cs.NullCount, len(cs.TopN), len(cs.Buckets))
+			}
+		}
+		if len(result.Accuracy.IndexStats) > 0 {
+			fmt.Printf("  Index stats (%d indexes):\n", len(result.Accuracy.IndexStats))
+			for _, is := range result.Accuracy.IndexStats {
+				fmt.Printf("    %-20s NDV=%-10d NullCount=%-8d TopN=%d Buckets=%d\n",
+					is.Name, is.NDV, is.NullCount, len(is.TopN), len(is.Buckets))
 			}
 		}
 		fmt.Println()
