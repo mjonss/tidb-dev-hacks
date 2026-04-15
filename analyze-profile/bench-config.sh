@@ -18,8 +18,27 @@ PLAYGROUND_TAG="${PLAYGROUND_TAG:-analyze-bench}"
 PD_NUM=1
 KV_NUM=1
 TIDB_NUM=1
-# Give TiDB enough memory; ANALYZE on 8000 partitions can use >8GB.
-TIDB_CONFIG="${TIDB_CONFIG:-}"   # optional path to tidb.toml
+# Memory limits per component — roughly production-shaped so OOMs and
+# quota-driven query aborts show up in the benchmark rather than the host
+# swapping to death. bench.sh renders these into tomls under
+# ${OUTPUT_ROOT}/configs/ and passes them via --db.config / --kv.config /
+# --pd.config. Set any of {TIDB,TIKV,PD}_CONFIG to override with your own
+# toml instead of letting the script render one.
+TIDB_MEM_GB="${TIDB_MEM_GB:-8}"           # TiDB performance.server-memory-quota
+TIKV_MEM_GB="${TIKV_MEM_GB:-8}"           # TiKV memory.memory-usage-limit
+TIKV_BLOCK_CACHE_GB="${TIKV_BLOCK_CACHE_GB:-3}"   # TiKV block-cache.capacity
+PD_MEM_FRACTION="${PD_MEM_FRACTION:-0.125}"       # PD server-memory-limit (0-1)
+
+# TiKV low-disk tolerance. Default raft-space and reserve-space (~5% of the
+# disk each) would refuse to start TiKV on a laptop with a nearly-full SSD.
+# Zero them out and set an explicit low-space threshold so TiKV runs even
+# on small free volumes.
+TIKV_LOW_SPACE_THRESHOLD="${TIKV_LOW_SPACE_THRESHOLD:-10GiB}"
+TIKV_RESERVE_SPACE="${TIKV_RESERVE_SPACE:-0}"
+TIKV_RESERVE_RAFT_SPACE="${TIKV_RESERVE_RAFT_SPACE:-0}"
+TIDB_CONFIG="${TIDB_CONFIG:-}"   # optional: your own tidb.toml (skips render)
+TIKV_CONFIG="${TIKV_CONFIG:-}"
+PD_CONFIG="${PD_CONFIG:-}"
 
 # --- Data / tables ----------------------------------------------------------
 DB_NAME="${DB_NAME:-analyze_profile}"

@@ -57,19 +57,58 @@ playground_running() {
   [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
 }
 
+render_memory_configs() {
+  local cfg_dir="${OUTPUT_ROOT}/configs"
+  mkdir -p "${cfg_dir}"
+  if [[ -z "${TIDB_CONFIG}" ]]; then
+    TIDB_CONFIG="${cfg_dir}/tidb.toml"
+    cat > "${TIDB_CONFIG}" <<EOF
+# Rendered by bench.sh — limits TiDB memory to ${TIDB_MEM_GB} GB.
+[performance]
+server-memory-quota = $(( TIDB_MEM_GB * 1024 * 1024 * 1024 ))
+EOF
+  fi
+  if [[ -z "${TIKV_CONFIG}" ]]; then
+    TIKV_CONFIG="${cfg_dir}/tikv.toml"
+    cat > "${TIKV_CONFIG}" <<EOF
+# Rendered by bench.sh — limits TiKV memory to ${TIKV_MEM_GB} GB and relaxes
+# disk-space reservations so it runs on nearly-full volumes.
+[memory]
+memory-usage-limit = "${TIKV_MEM_GB}GB"
+
+[storage]
+reserve-raft-space = ${TIKV_RESERVE_RAFT_SPACE}
+reserve-space = ${TIKV_RESERVE_SPACE}
+low-space-threshold = "${TIKV_LOW_SPACE_THRESHOLD}"
+
+[storage.block-cache]
+capacity = "${TIKV_BLOCK_CACHE_GB}GB"
+EOF
+  fi
+  if [[ -z "${PD_CONFIG}" ]]; then
+    PD_CONFIG="${cfg_dir}/pd.toml"
+    cat > "${PD_CONFIG}" <<EOF
+# Rendered by bench.sh — caps PD's share of system memory.
+server-memory-limit = ${PD_MEM_FRACTION}
+EOF
+  fi
+  log "Memory limits: TiDB=${TIDB_MEM_GB}GB, TiKV=${TIKV_MEM_GB}GB (cache ${TIKV_BLOCK_CACHE_GB}GB), PD=${PD_MEM_FRACTION}"
+}
+
 playground_start() {
   local bin="$1"
   [[ -x "$bin" ]] || die "tidb-server binary not executable: $bin"
   if playground_running; then
     die "playground still running (pid $(cat "${PLAYGROUND_PID_FILE}")) — stop first"
   fi
+  render_memory_configs
   log "Starting fresh playground (tidb=${bin})"
-  local extra=()
-  [[ -n "${TIDB_CONFIG}" ]] && extra+=(--db.config "${TIDB_CONFIG}")
   "${TIUP}" playground nightly \
     --db "${TIDB_NUM}" --kv "${KV_NUM}" --pd "${PD_NUM}" \
     --db.binpath "${bin}" \
-    "${extra[@]}" \
+    --db.config "${TIDB_CONFIG}" \
+    --kv.config "${TIKV_CONFIG}" \
+    --pd.config "${PD_CONFIG}" \
     >"${PLAYGROUND_LOG}" 2>&1 &
   echo $! > "${PLAYGROUND_PID_FILE}"
   # Wait up to 180s for TiDB to accept connections (fresh cluster takes longer).
