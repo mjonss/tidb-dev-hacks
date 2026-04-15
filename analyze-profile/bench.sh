@@ -221,7 +221,9 @@ playground_stop() {
 }
 
 # Full reload: stop any running cluster, start fresh with the given binary,
-# restore the combined backup (built lazily on first call), warm caches.
+# restore the combined backup (built lazily on first call). Callers are
+# responsible for warming caches — the matrix loop does it per iteration,
+# and cmd_setup does it once for interactive use.
 playground_reload() {
   local bin="$1"
   if [[ ! -f "${COMBINED_BACKUP_DIR}/backupmeta" ]]; then
@@ -230,7 +232,6 @@ playground_reload() {
   playground_stop
   playground_start "${bin}"
   br_restore "${COMBINED_BACKUP_DIR}"
-  warmup
 }
 
 warmup() {
@@ -565,18 +566,25 @@ cmd_build() {
 
 cmd_setup() {
   mkdir -p "${OUTPUT_ROOT}"
-  : > "${RUN_MANIFEST}"   # truncate; runs re-append
   build_analyzer
-  # Do one reload on BASE so users can poke at the cluster interactively.
-  # The real matrix will reload again per iteration.
+  # Leave a cluster up on BASE so users can poke at the data interactively.
+  # Chain commands (all / smoke / run) do NOT go through cmd_setup — they
+  # let run_matrix_for_label manage its own cluster lifecycle to avoid a
+  # redundant stop/start/restore cycle before the first iteration.
   playground_reload "${BIN_BASE}"
+  warmup
   log "Setup complete. Data in ${DB_NAME}.{${PART_TABLE},${NONPART_TABLE}}"
 }
 
 cmd_run() {
   local scope="${1:-all}"
   mkdir -p "${OUTPUT_ROOT}"
-  touch "${RUN_MANIFEST}"
+  # Truncate the manifest — run_matrix_for_label appends one line per cell,
+  # and we want each top-level `run` invocation to start a fresh record.
+  # Callers that want to preserve prior runs can skip cmd_run and invoke
+  # run_matrix_for_label directly.
+  : > "${RUN_MANIFEST}"
+  build_analyzer
   case "${scope}" in
     all|both)
       run_matrix_for_label "${LABEL_BASE}" "${BIN_BASE}"
@@ -595,6 +603,7 @@ cmd_run() {
       run_one_profile "${LABEL_PR}"   part-full clean ON 1
       playground_stop
       ;;
+    # (`all`/`pr`/`base`/`escalate` handled above)
     escalate)
       # Phase 1: async=ON only, full matrix.
       local saved_vals=("${ASYNC_MERGE_VALUES[@]}")
@@ -634,7 +643,8 @@ cmd_prepare() {
 
 cmd_all() {
   cmd_build
-  cmd_setup
+  # Skip cmd_setup — cmd_run calls playground_reload itself, and a separate
+  # setup reload would throw away the fresh cluster just to rebuild it.
   cmd_run all
   cmd_compare > "${OUTPUT_ROOT}/report.txt"
   log "Report: ${OUTPUT_ROOT}/report.txt"
@@ -650,7 +660,6 @@ cmd_smoke() {
   fi
   log "SMOKE RUN — minimal matrix at ${OUTPUT_ROOT}"
   cmd_build
-  cmd_setup
   cmd_run all
   cmd_compare | tee "${OUTPUT_ROOT}/report.txt"
   log "Smoke report: ${OUTPUT_ROOT}/report.txt"
