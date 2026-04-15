@@ -112,62 +112,94 @@ def load(run_dir: str) -> dict | None:
     return data.get("accuracy")
 
 
-def _parse_numeric_bound(s):
-    """Try to parse a bucket bound as a number.
+# KS distance only needs a total order on bucket bounds. ISO dates/datetimes
+# already lex-sort chronologically, so string ordering is fine for them.
+# Only numeric strings need coercion ("10" < "9" lex would be wrong).
+# Parse ladder: int → float → string. The first successful rank for the
+# first bucket fixes the column's type; if ranks disagree between branches
+# we fall back to string comparison.
 
-    TiDB's stats_dump.json base64-encodes bounds (e.g. "NTk=" → "59"), so
-    we try base64 decoding first. If the decoded string is a number, use
-    it. For non-numeric columns (strings, blobs, dates) we return None and
-    the caller skips the CDF distance for that column."""
+
+def _decode_bound(s):
+    """Base64-decode a stats_dump bound. Falls through to the raw string if
+    decoding fails (handles both stats_dump.json and SHOW output)."""
     import base64
     if s is None:
-        return None
+        return ""
     s = str(s).strip()
     if not s:
-        return None
-    # Try base64 first (stats_dump.json format).
+        return ""
     try:
-        decoded = base64.b64decode(s, validate=True).decode("utf-8", "replace").strip()
-        if decoded:
-            try:
-                return float(decoded)
-            except ValueError:
-                pass
+        return base64.b64decode(s, validate=True).decode("utf-8", "replace").strip()
     except Exception:
-        pass
-    # Fall back to direct numeric parse (SHOW STATS_BUCKETS TSV format).
-    try:
-        return float(s)
-    except ValueError:
-        return None
+        return s
+
+
+def _parse_ordered_bound(s, rank=None):
+    """Parse a decoded bound at a specific rank, or try int → float → string.
+    Returns (rank, sort_key), or (None, None) on empty input."""
+    decoded = _decode_bound(s)
+    if decoded == "":
+        return (None, None)
+    if rank in (None, "int"):
+        try:
+            return ("int", int(decoded))
+        except ValueError:
+            if rank == "int":
+                return (None, None)
+    if rank in (None, "float"):
+        try:
+            return ("float", float(decoded))
+        except ValueError:
+            if rank == "float":
+                return (None, None)
+    return ("string", decoded)
 
 
 def cdf_from_buckets(buckets):
-    """Build [(x, cum_frac), ...] from a histogram. upper_bound is the x-axis;
-    cumulative count is normalized to [0,1]. Returns None if bounds can't all
-    be parsed as numbers."""
+    """Build (rank, [(key, cum_frac), ...]) from a histogram. The first
+    bucket's parse fixes the rank; remaining buckets reuse it."""
     if not buckets:
-        return None
+        return (None, None)
     last_count = buckets[-1].get("count", 0)
     if last_count <= 0:
-        return None
+        return (None, None)
+    first_rank, _ = _parse_ordered_bound(buckets[0].get("upper_bound"))
+    if first_rank is None:
+        return (None, None)
     points = []
     for b in buckets:
-        x = _parse_numeric_bound(b.get("upper_bound"))
-        if x is None:
-            return None
-        points.append((x, b.get("count", 0) / last_count))
+        _, key = _parse_ordered_bound(b.get("upper_bound"), rank=first_rank)
+        if key is None:
+            # Shouldn't happen for well-formed columns, but fall back
+            # to string ordering to stay useful.
+            return _cdf_as_strings(buckets, last_count)
+        points.append((key, b.get("count", 0) / last_count))
     points.sort(key=lambda p: p[0])
-    return points
+    return (first_rank, points)
+
+
+def _cdf_as_strings(buckets, last_count):
+    points = [(_decode_bound(b.get("upper_bound")),
+               b.get("count", 0) / last_count) for b in buckets]
+    points.sort(key=lambda p: p[0])
+    return ("string", points)
 
 
 def ks_distance(a, b):
-    """Kolmogorov-Smirnov distance between two CDFs: max |F_A(x) - F_B(x)|.
-    0 = identical distribution, 1 = disjoint. Samples at the union of
-    x-values from both."""
-    if not a or not b:
+    """Kolmogorov-Smirnov distance: max |F_A(x) - F_B(x)|. Takes
+    (rank, points) tuples from cdf_from_buckets. If ranks disagree, both
+    sides are recomputed lexicographically."""
+    rank_a, pts_a = a
+    rank_b, pts_b = b
+    if not pts_a or not pts_b:
         return 0.0
-    xs = sorted({p[0] for p in a} | {p[0] for p in b})
+
+    if rank_a != rank_b:
+        pts_a = sorted(((str(k), v) for k, v in pts_a), key=lambda p: p[0])
+        pts_b = sorted(((str(k), v) for k, v in pts_b), key=lambda p: p[0])
+
+    xs = sorted({p[0] for p in pts_a} | {p[0] for p in pts_b})
 
     def cdf_at(points, x):
         if x < points[0][0]:
@@ -183,7 +215,7 @@ def ks_distance(a, b):
                 hi = mid - 1
         return points[lo][1]
 
-    return max(abs(cdf_at(a, x) - cdf_at(b, x)) for x in xs)
+    return max(abs(cdf_at(pts_a, x) - cdf_at(pts_b, x)) for x in xs)
 
 
 def histogram_jaccard(a, b):
@@ -395,9 +427,9 @@ def print_diff(label_a: str, label_b: str, a: dict, b: dict):
                 by = y.get("_buckets") or []
                 if not bx and not by:
                     continue
-                cx = cdf_from_buckets(bx)
+                cx = cdf_from_buckets(bx)   # (rank, points) or (None, None)
                 cy = cdf_from_buckets(by)
-                ks = ks_distance(cx, cy) if (cx and cy) else None
+                ks = ks_distance(cx, cy) if (cx[0] and cy[0]) else None
                 jac = histogram_jaccard(bx, by)
                 dist_rows.append((name, ks, jac, len(bx), len(by)))
             if dist_rows:
