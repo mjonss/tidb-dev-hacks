@@ -123,51 +123,89 @@ playground_start() {
   die "playground did not come up in 180s (see ${PLAYGROUND_LOG})"
 }
 
-playground_stop() {
-  local pid=""
-  if [[ -f "${PLAYGROUND_PID_FILE}" ]]; then
-    pid=$(cat "${PLAYGROUND_PID_FILE}")
-  fi
-  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-    log "Stopping playground (pid ${pid})"
-    # SIGINT asks tiup playground to shut down cleanly (PD + TiKV + TiDB).
-    kill -INT "${pid}" 2>/dev/null || true
-    local i
-    for i in $(seq 1 60); do
-      if ! kill -0 "${pid}" 2>/dev/null; then break; fi
-      sleep 1
-    done
-    if kill -0 "${pid}" 2>/dev/null; then
-      log "playground did not exit on SIGINT; sending SIGKILL"
-      kill -9 "${pid}" 2>/dev/null || true
-    fi
-  else
-    log "No tracked playground pid; checking for stragglers"
-  fi
-  # Unconditional sweep — `tiup playground` spawns `tiup-playground`
-  # (the real component binary) plus pd/tikv/tidb children, any of which may
-  # outlive the shim we tracked. Match on the .tiup/data/ path shared by every
-  # tiup-launched process, since the actual tidb binary name is configurable
-  # (BIN_PR/BIN_BASE) and won't match a fixed string like 'bin/tidb-server'.
-  pkill -INT  -f 'tiup-playground'       2>/dev/null || true
-  pkill -INT  -f '\.tiup/data/'          2>/dev/null || true
-  pkill -INT  -f 'tidb-server.*--store=tikv' 2>/dev/null || true
-  pkill -INT  -f 'tikv-server'           2>/dev/null || true
-  pkill -INT  -f 'pd-server'             2>/dev/null || true
-  sleep 3
-  pkill -KILL -f 'tiup-playground'       2>/dev/null || true
-  pkill -KILL -f '\.tiup/data/'          2>/dev/null || true
-  pkill -KILL -f 'tidb-server.*--store=tikv' 2>/dev/null || true
-  pkill -KILL -f 'tikv-server'           2>/dev/null || true
-  pkill -KILL -f 'pd-server'             2>/dev/null || true
-  rm -f "${PLAYGROUND_PID_FILE}"
-  # Wait for port 4000 to be free so the next start doesn't collide.
-  local j
-  for j in $(seq 1 30); do
-    if ! (exec 3<>/dev/tcp/127.0.0.1/4000) 2>/dev/null; then break; fi
-    sleep 1
+# Return the tiup-playground binary PID (the actual component that spawns
+# pd/tikv/tidb and owns the data dir), not the tiup shim or any child.
+# Signal delivery must target this PID directly — propagation through the
+# `tiup` shim is not reliable.
+find_playground_pid() {
+  pgrep -f '/tiup-playground ' 2>/dev/null | head -1
+}
+
+# Parse the data dir (e.g. .tiup/data/VGxxxxx) out of a pd/tikv child's argv,
+# for diagnostics in the log.
+find_playground_data_dir() {
+  local argv
+  argv=$(pgrep -af 'pd-server.*\.tiup/data/' 2>/dev/null | head -1)
+  [[ -z "${argv}" ]] && return
+  printf '%s\n' "${argv}" | sed -nE 's|.*(\.tiup/data/[^/]+)/.*|\1|p' | head -1
+}
+
+# Wait for port 4000 to be released so the next playground_start doesn't
+# collide. Returns 0 when free, non-zero on timeout.
+wait_port_4000_free() {
+  local i
+  for i in $(seq 1 30); do
+    (exec 3<>/dev/tcp/127.0.0.1/4000) 2>/dev/null && { exec 3>&- 3<&-; sleep 1; continue; }
+    return 0
   done
-  sleep 2
+  return 1
+}
+
+# Graceful shutdown. tiup-playground cleans its data dir on its own when
+# SIGINT'd — we just need to actually reach it, and give TiKV time to flush.
+#   1. SIGINT tiup-playground directly (NOT the shim — signals don't
+#      propagate reliably through `tiup`).
+#   2. Wait up to 5 min; TiKV with GBs of data takes minutes to flush.
+#   3. Escalate to SIGTERM (15 × 2s), then SIGKILL as last resort.
+# We do NOT remove ~/.tiup/data/VG* dirs — if tiup couldn't clean up, the
+# dir is left behind for manual inspection/removal by the operator.
+playground_stop() {
+  local pg_pid data_dir
+  pg_pid=$(find_playground_pid)
+  data_dir=$(find_playground_data_dir)
+
+  if [[ -z "${pg_pid}" ]]; then
+    log "No tiup-playground process running"
+    rm -f "${PLAYGROUND_PID_FILE}"
+    wait_port_4000_free || true
+    return
+  fi
+
+  log "Stopping tiup-playground (pid=${pg_pid}, data_dir=${data_dir:-unknown})"
+
+  # SIGINT — tiup-playground's intended graceful-shutdown signal.
+  kill -INT "${pg_pid}" 2>/dev/null || true
+  local i
+  for i in $(seq 1 150); do        # 150 × 2s = 5 minutes
+    if ! kill -0 "${pg_pid}" 2>/dev/null; then
+      log "tiup-playground exited cleanly after ~$((i*2))s"
+      rm -f "${PLAYGROUND_PID_FILE}"
+      wait_port_4000_free || true
+      return
+    fi
+    sleep 2
+  done
+
+  # SIGTERM — one more gentle attempt.
+  log "SIGINT timed out after 5m; sending SIGTERM"
+  kill -TERM "${pg_pid}" 2>/dev/null || true
+  for i in $(seq 1 15); do
+    kill -0 "${pg_pid}" 2>/dev/null || break
+    sleep 2
+  done
+
+  if kill -0 "${pg_pid}" 2>/dev/null; then
+    log "SIGTERM timed out; sending SIGKILL (data dir ${data_dir:-unknown} will NOT be auto-cleaned — remove it manually)"
+    # Kill tiup-playground first so it can't respawn children, then any
+    # surviving pd/tikv/tidb that were its direct children.
+    kill -KILL "${pg_pid}" 2>/dev/null || true
+    pkill -KILL -f 'tikv-server.*\.tiup/data/'     2>/dev/null || true
+    pkill -KILL -f 'pd-server.*\.tiup/data/'       2>/dev/null || true
+    pkill -KILL -f 'tidb-server.*--store=tikv'     2>/dev/null || true
+  fi
+
+  rm -f "${PLAYGROUND_PID_FILE}"
+  wait_port_4000_free || log "port 4000 still busy after stop"
 }
 
 # Full reload: stop any running cluster, start fresh with the given binary,
@@ -209,8 +247,13 @@ br_restore() {
 
 br_backup_combined() {
   mkdir -p "$(dirname "${COMBINED_BACKUP_DIR}")"
-  # BR refuses to back up into a non-empty dir.
-  rm -rf "${COMBINED_BACKUP_DIR}"
+  # BR refuses to back up into a non-empty dir. Don't delete anything from
+  # here ourselves — if a prior backup is present, surface it and let the
+  # operator decide what to remove.
+  if [[ -d "${COMBINED_BACKUP_DIR}" ]] && [[ -n "$(ls -A "${COMBINED_BACKUP_DIR}" 2>/dev/null)" ]]; then
+    die "COMBINED_BACKUP_DIR is non-empty: ${COMBINED_BACKUP_DIR}
+    Remove it (or use 'bench.sh prepare' after removing) before re-backing up."
+  fi
   log "Backing up ${DB_NAME}.{${PART_TABLE},${NONPART_TABLE}} → ${COMBINED_BACKUP_DIR}"
   "${TIUP}" br:nightly backup db \
     --pd 127.0.0.1:2379 \
@@ -560,9 +603,13 @@ cmd_compare() { do_compare; }
 cmd_stop() { playground_stop; }
 
 cmd_prepare() {
-  # Rebuild the combined backup from scratch (idempotent: deletes existing).
+  # Build the combined backup. If one already exists, surface it — don't
+  # remove anything ourselves. Operator can rm the dir and re-run.
   mkdir -p "${OUTPUT_ROOT}"
-  rm -rf "${COMBINED_BACKUP_DIR}"
+  if [[ -f "${COMBINED_BACKUP_DIR}/backupmeta" ]]; then
+    die "Combined backup already at ${COMBINED_BACKUP_DIR}.
+    Remove it manually if you want to rebuild: rm -rf '${COMBINED_BACKUP_DIR}'"
+  fi
   prepare_combined_backup "${BIN_BASE}"
   log "Combined backup ready at ${COMBINED_BACKUP_DIR}"
 }
