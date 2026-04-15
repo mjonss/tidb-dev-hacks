@@ -5,8 +5,8 @@
 # --- Binaries ---------------------------------------------------------------
 # Absolute paths to the two tidb-server binaries to compare.
 # Build with: cd <worktree> && make && ls bin/tidb-server
-BIN_PR="${BIN_PR:-/Users/mattias/repos/tidb-dev-hacks/analyze-profile/tidb-server.pr}"
-BIN_BASE="${BIN_BASE:-/Users/mattias/repos/tidb-dev-hacks/analyze-profile/tidb-server.master}"
+BIN_PR="${BIN_PR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tidb-server.pr}"
+BIN_BASE="${BIN_BASE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tidb-server.master}"
 
 LABEL_PR="${LABEL_PR:-PR}"
 LABEL_BASE="${LABEL_BASE:-BASE}"
