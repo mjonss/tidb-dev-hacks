@@ -151,14 +151,20 @@ wait_port_4000_free() {
   return 1
 }
 
-# Graceful shutdown. tiup-playground cleans its data dir on its own when
-# SIGINT'd — we just need to actually reach it, and give TiKV time to flush.
-#   1. SIGINT tiup-playground directly (NOT the shim — signals don't
-#      propagate reliably through `tiup`).
-#   2. Wait up to 5 min; TiKV with GBs of data takes minutes to flush.
-#   3. Escalate to SIGTERM (15 × 2s), then SIGKILL as last resort.
-# We do NOT remove ~/.tiup/data/VG* dirs — if tiup couldn't clean up, the
-# dir is left behind for manual inspection/removal by the operator.
+# Graceful shutdown, matching the signal contract in tiup's
+# components/playground/main.go:
+#   * SIGHUP/INT/TERM/QUIT all trigger p.terminate(sig), which signals each
+#     child (pd/tikv/tidb) and SIGKILLs any that don't exit within 10s
+#     (forceKillAfterDuration in playground.go).
+#   * A SECOND SIGINT during shutdown calls terminate(SIGKILL) — skips the
+#     10s grace and kills children immediately. Data dir is STILL cleaned up.
+#   * Only SIGKILL'ing the tiup-playground process itself bypasses removeData
+#     and orphans the data dir.
+#
+# So our ladder is: SIGINT → wait → SIGINT again (fast-path) → wait → SIGKILL
+# tiup-playground as last resort. We do NOT pkill pd/tikv/tidb ourselves —
+# that would pre-empt tiup's own shutdown logic and could leave instances
+# half-stopped. We do not remove any data dirs.
 playground_stop() {
   local pg_pid data_dir
   pg_pid=$(find_playground_pid)
@@ -173,10 +179,12 @@ playground_stop() {
 
   log "Stopping tiup-playground (pid=${pg_pid}, data_dir=${data_dir:-unknown})"
 
-  # SIGINT — tiup-playground's intended graceful-shutdown signal.
+  # SIGINT — tiup's graceful path (10s per-child grace, then SIGKILL child).
+  # With 1 pd + 1 tikv + 1 tidb this should complete in under 30s; give it 2
+  # minutes for safety in case a tikv flush blocks its signal handler.
   kill -INT "${pg_pid}" 2>/dev/null || true
   local i
-  for i in $(seq 1 150); do        # 150 × 2s = 5 minutes
+  for i in $(seq 1 60); do         # 60 × 2s = 2 minutes
     if ! kill -0 "${pg_pid}" 2>/dev/null; then
       log "tiup-playground exited cleanly after ~$((i*2))s"
       rm -f "${PLAYGROUND_PID_FILE}"
@@ -186,24 +194,25 @@ playground_stop() {
     sleep 2
   done
 
-  # SIGTERM — one more gentle attempt.
-  log "SIGINT timed out after 5m; sending SIGTERM"
-  kill -TERM "${pg_pid}" 2>/dev/null || true
-  for i in $(seq 1 15); do
-    kill -0 "${pg_pid}" 2>/dev/null || break
+  # Second SIGINT — tiup treats this as "terminate(SIGKILL)", which
+  # immediately SIGKILLs children while still running removeData afterward.
+  log "SIGINT did not exit in 2m; sending second SIGINT (fast-kill children, still cleans dir)"
+  kill -INT "${pg_pid}" 2>/dev/null || true
+  for i in $(seq 1 20); do         # 20 × 2s = 40s
+    if ! kill -0 "${pg_pid}" 2>/dev/null; then
+      log "tiup-playground exited after second SIGINT"
+      rm -f "${PLAYGROUND_PID_FILE}"
+      wait_port_4000_free || true
+      return
+    fi
     sleep 2
   done
 
-  if kill -0 "${pg_pid}" 2>/dev/null; then
-    log "SIGTERM timed out; sending SIGKILL (data dir ${data_dir:-unknown} will NOT be auto-cleaned — remove it manually)"
-    # Kill tiup-playground first so it can't respawn children, then any
-    # surviving pd/tikv/tidb that were its direct children.
-    kill -KILL "${pg_pid}" 2>/dev/null || true
-    pkill -KILL -f 'tikv-server.*\.tiup/data/'     2>/dev/null || true
-    pkill -KILL -f 'pd-server.*\.tiup/data/'       2>/dev/null || true
-    pkill -KILL -f 'tidb-server.*--store=tikv'     2>/dev/null || true
-  fi
-
+  # Last resort — SIGKILL tiup-playground itself. removeData will NOT run;
+  # data dir is left behind for manual cleanup.
+  log "Second SIGINT did not exit in 40s; SIGKILL'ing tiup-playground"
+  log "  data dir ${data_dir:-unknown} will NOT be auto-cleaned — remove it manually"
+  kill -KILL "${pg_pid}" 2>/dev/null || true
   rm -f "${PLAYGROUND_PID_FILE}"
   wait_port_4000_free || log "port 4000 still busy after stop"
 }
