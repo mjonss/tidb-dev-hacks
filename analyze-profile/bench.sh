@@ -127,17 +127,20 @@ playground_start() {
 # pd/tikv/tidb and owns the data dir), not the tiup shim or any child.
 # Signal delivery must target this PID directly — propagation through the
 # `tiup` shim is not reliable.
+#
+# `|| true` guards against set -o pipefail + set -e: when pgrep finds nothing
+# it exits 1, which under pipefail would abort the caller's assignment.
 find_playground_pid() {
-  pgrep -f '/tiup-playground ' 2>/dev/null | head -1
+  pgrep -f '/tiup-playground ' 2>/dev/null | head -1 || true
 }
 
 # Parse the data dir (e.g. .tiup/data/VGxxxxx) out of a pd/tikv child's argv,
 # for diagnostics in the log.
 find_playground_data_dir() {
   local argv
-  argv=$(pgrep -af 'pd-server.*\.tiup/data/' 2>/dev/null | head -1)
-  [[ -z "${argv}" ]] && return
-  printf '%s\n' "${argv}" | sed -nE 's|.*(\.tiup/data/[^/]+)/.*|\1|p' | head -1
+  argv=$(pgrep -af 'pd-server.*\.tiup/data/' 2>/dev/null | head -1 || true)
+  [[ -z "${argv}" ]] && return 0
+  printf '%s\n' "${argv}" | sed -nE 's|.*(\.tiup/data/[^/]+)/.*|\1|p' | head -1 || true
 }
 
 # Wait for port 4000 to be released so the next playground_start doesn't
@@ -369,6 +372,11 @@ run_one_profile() {
   done
   set_args+=(--set-variable "tidb_enable_async_merge_global_stats=${async}")
 
+  local analyze_columns_flag=()
+  if [[ -n "${ANALYZE_COLUMNS}" ]]; then
+    analyze_columns_flag=(--analyze-columns "${ANALYZE_COLUMNS}")
+  fi
+
   log "RUN ${label} ${scenario} ${state} async=${async} iter=${iter} → ${out_dir}"
   "${SCRIPT_DIR}/analyze-profile" profile \
     --db "${DB_NAME}" --table "${table}" \
@@ -377,6 +385,7 @@ run_one_profile() {
     --check-accuracy \
     --cpu-profile-seconds "${CPU_PROFILE_SECONDS}" \
     --output-dir "${out_dir}" \
+    "${analyze_columns_flag[@]}" \
     "${set_args[@]}" \
     2> "${out_dir}/run.log" || log "WARN: analyze-profile returned non-zero (see ${out_dir}/run.log)"
 

@@ -130,6 +130,14 @@ COMMON_SET_VARS=(
 # --- Profile collection -----------------------------------------------------
 CPU_PROFILE_SECONDS="${CPU_PROFILE_SECONDS:-10}"
 
+# ANALYZE column scope — "all" forces full histograms/TopN for every column,
+# "predicate" honours the server default (only columns used as predicates get
+# full stats; others get FMSketch + null count only). For a benchmark that
+# exercises the global-stats merge path across many columns, "all" is
+# essential — otherwise only pk gets a real histogram and c1..cN just get
+# coarse sketches, making the measurement unrepresentative.
+ANALYZE_COLUMNS="${ANALYZE_COLUMNS:-all}"
+
 # Output root — each run gets its own timestamped subdir under a per-branch
 # folder, e.g. output-bench/PR/run_20260415_.../
 OUTPUT_ROOT="${OUTPUT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/output-bench}"
