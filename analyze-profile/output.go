@@ -14,6 +14,10 @@ type ProfileResult struct {
 	RunDir           string                `json:"run_dir"`
 	SessionVars      map[string]string     `json:"session_vars"`
 	AnalyzeDuration  string                `json:"analyze_duration"`
+	// AnalyzeDurationNs is the raw wall-clock duration as nanoseconds.
+	// Use this (not AnalyzeDuration) for comparisons and averages — it
+	// preserves sub-ms precision that gets lost in the string form.
+	AnalyzeDurationNs int64                `json:"analyze_duration_ns"`
 	AnalyzeStartTime time.Time             `json:"analyze_start_time"`
 	AnalyzeEndTime   time.Time             `json:"analyze_end_time"`
 	PartitionJobs    []PartitionJobSummary `json:"partition_jobs"`
