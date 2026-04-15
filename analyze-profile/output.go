@@ -10,27 +10,27 @@ import (
 
 // ProfileResult is the top-level JSON output structure.
 type ProfileResult struct {
-	Config           OutputConfig          `json:"config"`
-	RunDir           string                `json:"run_dir"`
-	SessionVars      map[string]string     `json:"session_vars"`
-	AnalyzeDuration  string                `json:"analyze_duration"`
+	Config          OutputConfig      `json:"config"`
+	RunDir          string            `json:"run_dir"`
+	SessionVars     map[string]string `json:"session_vars"`
+	AnalyzeDuration string            `json:"analyze_duration"`
 	// AnalyzeDurationNs is the raw wall-clock duration as nanoseconds.
 	// Use this (not AnalyzeDuration) for comparisons and averages — it
 	// preserves sub-ms precision that gets lost in the string form.
-	AnalyzeDurationNs int64                `json:"analyze_duration_ns"`
-	AnalyzeStartTime time.Time             `json:"analyze_start_time"`
-	AnalyzeEndTime   time.Time             `json:"analyze_end_time"`
-	PartitionJobs    []PartitionJobSummary `json:"partition_jobs"`
-	TiDBMetrics      []MetricSample        `json:"tidb_metrics"`
-	TiKVMetrics      []MetricSample        `json:"tikv_metrics"`
-	LogEntries       []LogEntry            `json:"log_entries"`
-	SlowQueries      []SlowQueryEntry      `json:"slow_queries"`
-	PprofFiles       PprofFiles            `json:"pprof_files"`
-	AnalyzeStatus    []AnalyzeStatusEntry  `json:"analyze_status_after"`
-	Accuracy         *AccuracyResult       `json:"accuracy,omitempty"`
-	GoroutineSamples []GoroutineSample     `json:"goroutine_samples,omitempty"`
-	MutexBeforeFile  string                `json:"mutex_before_file,omitempty"`
-	MutexAfterFile   string                `json:"mutex_after_file,omitempty"`
+	AnalyzeDurationNs int64                 `json:"analyze_duration_ns"`
+	AnalyzeStartTime  time.Time             `json:"analyze_start_time"`
+	AnalyzeEndTime    time.Time             `json:"analyze_end_time"`
+	PartitionJobs     []PartitionJobSummary `json:"partition_jobs"`
+	TiDBMetrics       []MetricSample        `json:"tidb_metrics"`
+	TiKVMetrics       []MetricSample        `json:"tikv_metrics"`
+	LogEntries        []LogEntry            `json:"log_entries"`
+	SlowQueries       []SlowQueryEntry      `json:"slow_queries"`
+	PprofFiles        PprofFiles            `json:"pprof_files"`
+	AnalyzeStatus     []AnalyzeStatusEntry  `json:"analyze_status_after"`
+	Accuracy          *AccuracyResult       `json:"accuracy,omitempty"`
+	GoroutineSamples  []GoroutineSample     `json:"goroutine_samples,omitempty"`
+	MutexBeforeFile   string                `json:"mutex_before_file,omitempty"`
+	MutexAfterFile    string                `json:"mutex_after_file,omitempty"`
 }
 
 type OutputConfig struct {
@@ -60,12 +60,12 @@ type SlowQueryEntry struct {
 	QueryTime    float64 `json:"query_time"`
 	ParseTime    float64 `json:"parse_time,omitempty"`
 	CompileTime  float64 `json:"compile_time,omitempty"`
-	ProcessTime  float64 `json:"process_time,omitempty"`   // TiDB coprocessor CPU time
-	WaitTime     float64 `json:"wait_time,omitempty"`      // waiting on TiKV response
-	BackoffTime  float64 `json:"backoff_time,omitempty"`   // TiKV backoffs (region-not-leader, etc.)
-	CopTime      float64 `json:"cop_time,omitempty"`       // total coprocessor wall
-	CopProcAvg   float64 `json:"cop_proc_avg,omitempty"`   // avg per-request CPU on TiKV
-	CopWaitAvg   float64 `json:"cop_wait_avg,omitempty"`   // avg per-request queue wait on TiKV
+	ProcessTime  float64 `json:"process_time,omitempty"` // TiDB coprocessor CPU time
+	WaitTime     float64 `json:"wait_time,omitempty"`    // waiting on TiKV response
+	BackoffTime  float64 `json:"backoff_time,omitempty"` // TiKV backoffs (region-not-leader, etc.)
+	CopTime      float64 `json:"cop_time,omitempty"`     // total coprocessor wall
+	CopProcAvg   float64 `json:"cop_proc_avg,omitempty"` // avg per-request CPU on TiKV
+	CopWaitAvg   float64 `json:"cop_wait_avg,omitempty"` // avg per-request queue wait on TiKV
 	RequestCount int64   `json:"request_count,omitempty"`
 	ProcessKeys  int64   `json:"process_keys,omitempty"`
 	TotalKeys    int64   `json:"total_keys"`
@@ -246,7 +246,6 @@ func printSummary(result *ProfileResult) {
 		}
 		fmt.Println()
 	}
-
 
 	// Stats extraction.
 	// SHOW STATS_HISTOGRAMS reads TiDB's in-memory stats cache, which evicts

@@ -24,11 +24,11 @@ type Config struct {
 	Password   string
 	StatusPort int
 
-	DB         string
-	Table      string
-	Partitions int
-	Rows       int
-	Columns    int
+	DB                string
+	Table             string
+	Partitions        int
+	Rows              int
+	Columns           int
 	BatchSize         int
 	InsertConcurrency int
 	Seed              int64

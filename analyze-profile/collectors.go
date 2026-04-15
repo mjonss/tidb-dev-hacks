@@ -163,12 +163,12 @@ func (p *AnalyzeJobsPoller) Snapshots() []AnalyzeJobSnapshot {
 
 // MetricsPoller scrapes /metrics endpoints periodically.
 type MetricsPoller struct {
-	cfg     *Config
-	mu      sync.Mutex
-	tidb    []MetricSample
-	tikv    []MetricSample
-	stopCh  chan struct{}
-	done    chan struct{}
+	cfg    *Config
+	mu     sync.Mutex
+	tidb   []MetricSample
+	tikv   []MetricSample
+	stopCh chan struct{}
+	done   chan struct{}
 }
 
 func NewMetricsPoller(cfg *Config) *MetricsPoller {
@@ -524,10 +524,10 @@ type GoroutineCollector struct {
 
 // GoroutineSample is one snapshot of the goroutine dump, with per-state counts.
 type GoroutineSample struct {
-	Timestamp   time.Time      `json:"timestamp"`
-	Total       int            `json:"total"`
-	ByState     map[string]int `json:"by_state"`
-	DumpFile    string         `json:"dump_file"`
+	Timestamp time.Time      `json:"timestamp"`
+	Total     int            `json:"total"`
+	ByState   map[string]int `json:"by_state"`
+	DumpFile  string         `json:"dump_file"`
 }
 
 func NewGoroutineCollector(cfg *Config, outputDir string) *GoroutineCollector {
@@ -607,8 +607,10 @@ func (g *GoroutineCollector) capture(idx int) {
 
 // summarizeGoroutineDump parses a debug=1 goroutine dump and counts goroutines
 // per state. The dump format is:
-//   goroutine 42 [semacquire, 1 minutes]:
-//   <stack frames...>
+//
+//	goroutine 42 [semacquire, 1 minutes]:
+//	<stack frames...>
+//
 // We group "IO wait", "chan receive", "chan send", "select", "semacquire",
 // "sync.Cond.Wait", "syscall", "runnable", "running", "sleep", etc.
 func summarizeGoroutineDump(path string) (map[string]int, int, error) {
