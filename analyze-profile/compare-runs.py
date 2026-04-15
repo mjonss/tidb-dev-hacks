@@ -184,15 +184,42 @@ def load_run(run_dir):
     result["peak_heap_gb"] = peak_heap / (1024**3)
     result["peak_goroutines"] = peak_goroutines
 
-    # Slow queries
+    # Slow queries — extended breakdown
     slow = data.get("slow_queries", [])
     result["slow_queries"] = slow
     if slow:
-        result["slow_query_time"] = slow[0].get("query_time", 0)
-        result["slow_mem_max"] = slow[0].get("mem_max", 0)
-        result["slow_total_keys"] = slow[0].get("total_keys", 0)
+        s0 = slow[0]
+        for k in ("query_time", "parse_time", "compile_time", "process_time",
+                  "wait_time", "backoff_time", "cop_time",
+                  "cop_proc_avg", "cop_wait_avg",
+                  "request_count", "process_keys", "total_keys",
+                  "mem_max", "disk_max"):
+            result["slow_" + k] = s0.get(k, 0) or 0
+        result["slow_backoff_types"] = s0.get("backoff_types", "") or ""
     else:
-        result["slow_query_time"] = result["slow_mem_max"] = result["slow_total_keys"] = 0
+        for k in ("query_time", "parse_time", "compile_time", "process_time",
+                  "wait_time", "backoff_time", "cop_time",
+                  "cop_proc_avg", "cop_wait_avg",
+                  "request_count", "process_keys", "total_keys",
+                  "mem_max", "disk_max"):
+            result["slow_" + k] = 0
+        result["slow_backoff_types"] = ""
+
+    # Goroutine state timeline (from GoroutineCollector samples).
+    gr = data.get("goroutine_samples", []) or []
+    result["goroutine_samples"] = gr
+    result["goroutine_peak_total"] = max((g.get("total", 0) for g in gr), default=0)
+    # Aggregate per-state peaks across samples.
+    state_peaks = {}
+    for s in gr:
+        for k, v in (s.get("by_state") or {}).items():
+            if v > state_peaks.get(k, 0):
+                state_peaks[k] = v
+    result["goroutine_state_peaks"] = state_peaks
+
+    # Mutex profile file paths (compare-runs.py calls pprof on them inline).
+    result["mutex_before_file"] = data.get("mutex_before_file", "")
+    result["mutex_after_file"] = data.get("mutex_after_file", "")
 
     # File counts
     files = os.listdir(run_dir)
@@ -214,6 +241,81 @@ def load_run(run_dir):
 
 def fmt_gb(gb):
     return f"{gb:.2f} GB"
+
+
+def _metric_delta(samples, start, end, key_or_prefix, exact=True):
+    """Compute the delta (last - first) of a counter-type metric across the
+    samples that fall within [start, end]. `exact=True` requires an exact key
+    match; `False` matches on prefix."""
+    if not samples:
+        return 0.0
+    from datetime import timedelta
+    within = []
+    for s in samples:
+        ts = parse_ts(s.get("timestamp", ""))
+        if ts is None:
+            continue
+        if start and end and (ts < start - timedelta(seconds=2) or ts > end + timedelta(seconds=2)):
+            continue
+        within.append(s)
+    if len(within) < 2:
+        # Fall back to using all samples.
+        within = samples
+        if len(within) < 2:
+            return 0.0
+    def find(sample):
+        m = sample.get("metrics", {}) or {}
+        if exact:
+            return m.get(key_or_prefix, 0) or 0
+        for k, v in m.items():
+            if k.startswith(key_or_prefix):
+                return v or 0
+        return 0
+    return (find(within[-1]) - find(within[0])) or 0
+
+
+def _tidb_metric_delta(run, key):
+    start = parse_ts(run.get("analyze_start", ""))
+    end = parse_ts(run.get("analyze_end", ""))
+    return _metric_delta(run.get("metrics_raw", []), start, end, key)
+
+
+def _tikv_metric_delta(run, key):
+    """TiKV metrics are stored with a host prefix like
+    tikv_127.0.0.1:20180_... — strip to match the label part the caller passed."""
+    start = parse_ts(run.get("analyze_start", ""))
+    end = parse_ts(run.get("analyze_end", ""))
+    # Read the TiKV samples from profile_result.json (lazy-loaded per run).
+    import json as _json
+    path = os.path.join(run["dir"], "profile_result.json")
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except Exception:
+        return 0
+    samples = data.get("tikv_metrics", []) or []
+    # Match the host-prefixed key. We accept any sample key that ends with
+    # the requested suffix (e.g. tikv_127.0.0.1:20180_<key>).
+    def find(sample):
+        m = sample.get("metrics", {}) or {}
+        for k, v in m.items():
+            if k.endswith("_" + key) or k.endswith(key):
+                return v or 0
+        return 0
+    from datetime import timedelta
+    within = []
+    for s in samples:
+        ts = parse_ts(s.get("timestamp", ""))
+        if ts is None:
+            continue
+        if start and end and (ts < start - timedelta(seconds=2) or ts > end + timedelta(seconds=2)):
+            continue
+        within.append(s)
+    if len(within) < 2:
+        within = samples[:2] if len(samples) >= 2 else samples
+    if len(within) < 2:
+        return 0
+    return (find(within[-1]) - find(within[0])) or 0
 
 
 def fmt_secs(s):
@@ -491,6 +593,207 @@ def print_multi_comparison(groups):
             vals = [r[tsv] for r in runs]
             parts.append(f"{label}={vals}")
         print(f"    {tsv}: {', '.join(parts)}")
+
+    # --- Slow-query timing breakdown (extended) ---
+    # TiDB's closest-to-builtin timing decomposition. All values are seconds
+    # unless noted. The wait/cop_wait breakdown is the direct answer to
+    # "where did wall-clock time go that wasn't on-CPU?".
+    print(f"\n  --- Slow-Query Timing Breakdown (seconds, first run in each group) ---")
+    def fmt_s(x): return f"{x:.3f}"
+    header = f"    {'metric':<18}"
+    for label, _ in groups:
+        header += f"  {label:>12}"
+    print(header)
+    for key, label_name in [
+        ("slow_query_time", "Query_time"),
+        ("slow_parse_time", "  parse"),
+        ("slow_compile_time", "  compile"),
+        ("slow_process_time", "  process (CPU)"),
+        ("slow_wait_time", "  wait (RPC)"),
+        ("slow_backoff_time", "  backoff"),
+        ("slow_cop_time", "Cop_time (total)"),
+        ("slow_cop_proc_avg", "  cop_proc_avg"),
+        ("slow_cop_wait_avg", "  cop_wait_avg"),
+    ]:
+        line = f"    {label_name:<18}"
+        for _, runs in groups:
+            r = runs[0]
+            line += f"  {fmt_s(r.get(key, 0)):>12}"
+        print(line)
+    # Non-timing slow-query columns:
+    for key, label_name, fmt in [
+        ("slow_request_count", "request_count", lambda x: f"{int(x)}"),
+        ("slow_process_keys", "process_keys", lambda x: f"{int(x)}"),
+        ("slow_total_keys", "total_keys", lambda x: f"{int(x)}"),
+        ("slow_mem_max", "mem_max (GB)", lambda x: f"{x/1e9:.2f}"),
+        ("slow_disk_max", "disk_max (GB)", lambda x: f"{x/1e9:.2f}"),
+    ]:
+        line = f"    {label_name:<18}"
+        for _, runs in groups:
+            r = runs[0]
+            line += f"  {fmt(r.get(key, 0)):>12}"
+        print(line)
+    # Backoff types, if any:
+    bo_any = any(r.get("slow_backoff_types") for _, runs in groups for r in runs)
+    if bo_any:
+        print(f"\n    backoff_types:")
+        for label, runs in groups:
+            bt = runs[0].get("slow_backoff_types", "") or "(none)"
+            print(f"      {label}: {bt}")
+
+    # --- Goroutine state timeline ---
+    # Shows how many TiDB goroutines were in each wait state during the run.
+    # High "chan receive" / "semacquire" / "select" counts indicate coordination
+    # overhead / blocking; high "runnable" means CPU is the bottleneck.
+    print(f"\n  --- Goroutine State Peaks (max per state, across all samples) ---")
+    all_states = set()
+    for _, runs in groups:
+        for r in runs:
+            all_states.update((r.get("goroutine_state_peaks") or {}).keys())
+    # Pick states of interest — these are the ones that usually dominate.
+    interesting = ["running", "runnable", "IO wait", "chan receive", "chan send",
+                   "select", "semacquire", "sync.Cond.Wait", "sleep", "syscall",
+                   "GC worker (idle)", "GC scavenge wait", "finalizer wait",
+                   "timer goroutine (idle)"]
+    # Include any other state that actually appears with non-trivial count.
+    for s in sorted(all_states):
+        if s not in interesting:
+            interesting.append(s)
+    header = f"    {'state':<25}"
+    for label, _ in groups:
+        header += f"  {label:>8}"
+    print(header)
+    for state in interesting:
+        row = {label: max((r.get("goroutine_state_peaks", {}).get(state, 0) for r in runs), default=0)
+               for label, runs in groups}
+        if max(row.values(), default=0) == 0:
+            continue
+        line = f"    {state:<25}"
+        for label, _ in groups:
+            line += f"  {row[label]:>8d}"
+        print(line)
+    # Total (summary) row.
+    row = {label: max((r.get("goroutine_peak_total", 0) for r in runs), default=0)
+           for label, runs in groups}
+    line = f"    {'(total peak goroutines)':<25}"
+    for label, _ in groups:
+        line += f"  {row[label]:>8d}"
+    print(line)
+
+    # --- Mutex contention ---
+    # Mutex profile delta (after - before). The top-5 contended mutex sites
+    # tell us which locks TiDB spent time blocked on during ANALYZE.
+    print(f"\n  --- Mutex Contention (top 5 by cum time, pprof of (after - before)) ---")
+    import subprocess
+    for label, runs in groups:
+        r = runs[0]
+        before = r.get("mutex_before_file", "")
+        after = r.get("mutex_after_file", "")
+        if not (before and after) or not (os.path.exists(before) and os.path.exists(after)):
+            print(f"    {label}: (missing)")
+            continue
+        try:
+            out = subprocess.check_output(
+                ["go", "tool", "pprof", "-top", "-nodecount", "5",
+                 "-base", before, after],
+                stderr=subprocess.DEVNULL, text=True, timeout=30)
+        except Exception as e:
+            print(f"    {label}: pprof error: {e}")
+            continue
+        print(f"    {label}:")
+        for line in out.splitlines():
+            if line.strip().startswith("flat") or " 0" in line[:2]:
+                continue
+            # Print data lines only.
+            if any(line.lstrip().startswith(p) for p in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-")):
+                print(f"      {line.rstrip()}")
+
+    # --- TiKV coprocessor request durations (Tier 2 #4) ---
+    # sum/count = avg per-request wall time on TiKV for each req type.
+    print(f"\n  --- TiKV Coprocessor Request Durations (avg = sum/count over run window) ---")
+    print(f"    {'req type':<25}", end="")
+    for label, _ in groups:
+        print(f"  {label+' cnt':>10} {label+' avg(s)':>12}", end="")
+    print()
+    cop_types = ["analyze_table", "analyze_full_sampling", "analyze_index",
+                 "select", "checksum_table", "index"]
+    for req in cop_types:
+        printed_any = False
+        line = f"    {req:<25}"
+        for label, runs in groups:
+            r = runs[0]
+            cnt = _tikv_metric_delta(r, f'tikv_coprocessor_request_duration_seconds_count{{req="{req}"}}')
+            sm = _tikv_metric_delta(r, f'tikv_coprocessor_request_duration_seconds_sum{{req="{req}"}}')
+            avg = (sm / cnt) if cnt else 0
+            if cnt:
+                printed_any = True
+            line += f"  {int(cnt):>10} {avg:>12.6f}"
+        if printed_any:
+            print(line)
+
+    # --- TiDB distsql / statement histograms (Tier 2 #5) ---
+    print(f"\n  --- TiDB Distsql / Statement / Scheduler Timings (over run window) ---")
+    print(f"    {'metric':<45}", end="")
+    for label, _ in groups:
+        print(f"  {label+' cnt':>10} {label+' avg(s)':>12}", end="")
+    print()
+    tidb_pairs = [
+        ("tidb_distsql_handle_query_duration_seconds",
+         "tidb_distsql_handle_query_duration"),
+        ("tidb_executor_statement_duration_seconds",
+         "tidb_executor_statement_duration"),
+        ("tidb_session_execute_duration_seconds",
+         "tidb_session_execute_duration"),
+        ("go_sched_latencies_seconds",
+         "go_sched_latencies (runqueue wait)"),
+        ("go_gc_duration_seconds",
+         "go_gc_duration"),
+    ]
+    for base, label_name in tidb_pairs:
+        line = f"    {label_name:<45}"
+        printed_any = False
+        for label, runs in groups:
+            r = runs[0]
+            cnt = _tidb_metric_delta(r, base + "_count")
+            sm = _tidb_metric_delta(r, base + "_sum")
+            avg = (sm / cnt) if cnt else 0
+            if cnt:
+                printed_any = True
+            line += f"  {int(cnt):>10} {avg:>12.6f}"
+        if printed_any:
+            print(line)
+
+    # --- Per-partition job gap analysis (Tier 2 #6) ---
+    # Sum per-partition durations and compare to ANALYZE wall-clock; the
+    # ratio is the implied average concurrency. Low ratio → partition work
+    # was serialized; high ratio → well-parallelized.
+    print(f"\n  --- Partition Job Timeline (first run in each group) ---")
+    for label, runs in groups:
+        r = runs[0]
+        jp = os.path.join(r["dir"], "profile_result.json")
+        try:
+            with open(jp) as f:
+                raw = json.load(f)
+            pjs = raw.get("partition_jobs", []) or []
+        except Exception:
+            pjs = []
+        if not pjs:
+            print(f"    {label}: (no partition_jobs)")
+            continue
+        durations = []
+        for j in pjs:
+            d = j.get("duration", "")
+            if d:
+                durations.append(parse_duration_to_seconds(d))
+        if not durations:
+            print(f"    {label}: {len(pjs)} jobs, no duration info (second-granularity timestamps)")
+            continue
+        total = sum(durations)
+        wall = r.get("analyze_duration_s", 0)
+        concurrency = (total / wall) if wall else 0
+        print(f"    {label}: {len(pjs)} jobs, sum_dur={total:.1f}s, wall={wall:.3f}s, "
+              f"implied avg concurrency={concurrency:.2f}x "
+              f"(min={min(durations):.1f}s, max={max(durations):.1f}s)")
 
     # Memory trajectory: compare first run from each group
     print(f"\n  --- Memory Trajectory (run #1 from each group) ---")

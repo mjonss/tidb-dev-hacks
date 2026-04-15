@@ -116,6 +116,12 @@ func runProfile(cfg *Config) error {
 		fmt.Fprintf(os.Stderr, "Tailing log: %s\n", cfg.TiDBLog)
 	}
 
+	goroutineCollector := NewGoroutineCollector(cfg, runDir)
+	goroutineCollector.Start()
+
+	mutexCollector := NewMutexProfileCollector(cfg, runDir)
+	mutexCollector.CaptureBefore()
+
 	// Start pprof loop (heap snapshot + CPU profile each iteration)
 	ctx, cancel := context.WithCancel(context.Background())
 	pprofCollector.StartLoop(ctx)
@@ -145,6 +151,8 @@ func runProfile(cfg *Config) error {
 		logTailer.Stop()
 	}
 	pprofCollector.Stop()
+	goroutineCollector.Stop()
+	mutexCollector.CaptureAfter()
 
 	// Final heap snapshot after ANALYZE
 	finalHeapPath := fmt.Sprintf("%s/heap_%d.pb.gz", runDir, len(pprofCollector.HeapFiles()))
@@ -208,9 +216,11 @@ func runProfile(cfg *Config) error {
 			HeapFiles: pprofCollector.HeapFiles(),
 			CPUFiles:  pprofCollector.CPUFiles(),
 		},
-		AnalyzeStatus: analyzeStatus,
-		Accuracy:      accuracyResult,
+		AnalyzeStatus:    analyzeStatus,
+		Accuracy:         accuracyResult,
+		GoroutineSamples: goroutineCollector.Samples(),
 	}
+	result.MutexBeforeFile, result.MutexAfterFile = mutexCollector.Files()
 
 	// Write JSON
 	jsonPath := fmt.Sprintf("%s/profile_result.json", runDir)
@@ -510,7 +520,16 @@ func dumpQueryToTSV(db *sql.DB, query, path string) error {
 }
 
 func querySlowQueries(db *sql.DB, cfg *Config, since time.Time) []SlowQueryEntry {
-	query := `SELECT query, query_time, mem_max, total_keys, digest
+	// Pull the full timing breakdown. The slow log columns are the closest
+	// thing TiDB has to a stage-by-stage wallclock decomposition for a
+	// statement.
+	query := `SELECT query, query_time,
+		parse_time, compile_time, process_time, wait_time,
+		backoff_time, cop_time,
+		IFNULL(cop_proc_avg, 0), IFNULL(cop_wait_avg, 0),
+		IFNULL(request_count, 0), IFNULL(process_keys, 0),
+		total_keys, mem_max, IFNULL(disk_max, 0),
+		IFNULL(backoff_types, ''), digest
 		FROM information_schema.slow_query
 		WHERE time >= ?
 		  AND (query LIKE '%ANALYZE%' OR query LIKE '%analyze%')
@@ -529,7 +548,14 @@ func querySlowQueries(db *sql.DB, cfg *Config, since time.Time) []SlowQueryEntry
 	var entries []SlowQueryEntry
 	for rows.Next() {
 		var e SlowQueryEntry
-		if err := rows.Scan(&e.Query, &e.QueryTime, &e.MemMax, &e.TotalKeys, &e.Digest); err != nil {
+		if err := rows.Scan(&e.Query, &e.QueryTime,
+			&e.ParseTime, &e.CompileTime, &e.ProcessTime, &e.WaitTime,
+			&e.BackoffTime, &e.CopTime,
+			&e.CopProcAvg, &e.CopWaitAvg,
+			&e.RequestCount, &e.ProcessKeys,
+			&e.TotalKeys, &e.MemMax, &e.DiskMax,
+			&e.BackoffTypes, &e.Digest); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: slow query scan failed: %v\n", err)
 			continue
 		}
 		entries = append(entries, e)

@@ -28,6 +28,9 @@ type ProfileResult struct {
 	PprofFiles       PprofFiles            `json:"pprof_files"`
 	AnalyzeStatus    []AnalyzeStatusEntry  `json:"analyze_status_after"`
 	Accuracy         *AccuracyResult       `json:"accuracy,omitempty"`
+	GoroutineSamples []GoroutineSample     `json:"goroutine_samples,omitempty"`
+	MutexBeforeFile  string                `json:"mutex_before_file,omitempty"`
+	MutexAfterFile   string                `json:"mutex_after_file,omitempty"`
 }
 
 type OutputConfig struct {
@@ -48,12 +51,28 @@ type PartitionJobSummary struct {
 	FailReason    string  `json:"fail_reason,omitempty"`
 }
 
+// SlowQueryEntry mirrors the fields we pull from information_schema.slow_query.
+// The breakdown columns (process/wait/backoff/cop_*) are the closest builtin
+// TiDB has to a timing decomposition of a statement. See
+// https://docs.pingcap.com/tidb/stable/identify-slow-queries/ for definitions.
 type SlowQueryEntry struct {
-	Query     string  `json:"query"`
-	QueryTime float64 `json:"query_time"`
-	MemMax    int64   `json:"mem_max"`
-	TotalKeys int64   `json:"total_keys"`
-	Digest    string  `json:"digest"`
+	Query        string  `json:"query"`
+	QueryTime    float64 `json:"query_time"`
+	ParseTime    float64 `json:"parse_time,omitempty"`
+	CompileTime  float64 `json:"compile_time,omitempty"`
+	ProcessTime  float64 `json:"process_time,omitempty"`   // TiDB coprocessor CPU time
+	WaitTime     float64 `json:"wait_time,omitempty"`      // waiting on TiKV response
+	BackoffTime  float64 `json:"backoff_time,omitempty"`   // TiKV backoffs (region-not-leader, etc.)
+	CopTime      float64 `json:"cop_time,omitempty"`       // total coprocessor wall
+	CopProcAvg   float64 `json:"cop_proc_avg,omitempty"`   // avg per-request CPU on TiKV
+	CopWaitAvg   float64 `json:"cop_wait_avg,omitempty"`   // avg per-request queue wait on TiKV
+	RequestCount int64   `json:"request_count,omitempty"`
+	ProcessKeys  int64   `json:"process_keys,omitempty"`
+	TotalKeys    int64   `json:"total_keys"`
+	MemMax       int64   `json:"mem_max"`
+	DiskMax      int64   `json:"disk_max,omitempty"`
+	BackoffTypes string  `json:"backoff_types,omitempty"`
+	Digest       string  `json:"digest"`
 }
 
 type PprofFiles struct {
@@ -95,24 +114,70 @@ func printSummary(result *ProfileResult) {
 	fmt.Printf("Duration:   %s\n", result.AnalyzeDuration)
 	fmt.Println()
 
-	// Per-partition timing
+	// Per-partition timing — summary only. Also compute the earliest start
+	// and latest end across partitions to show the partition-phase wallclock
+	// (which is wall = latest_end - earliest_start, typically less than the
+	// total ANALYZE because of the global-merge phase after).
 	if len(result.PartitionJobs) > 0 {
-		fmt.Println("--- Per-Partition Timing ---")
+		stateCounts := map[string]int{}
+		var durations []time.Duration
+		var earliestStart, latestEnd time.Time
+		const tsFmt = "2006-01-02 15:04:05"
 		for _, pj := range result.PartitionJobs {
-			durStr := ""
+			stateCounts[pj.State]++
 			if pj.Duration != "" {
-				durStr = fmt.Sprintf(" (%s)", pj.Duration)
+				if d, err := time.ParseDuration(pj.Duration); err == nil {
+					durations = append(durations, d)
+				}
 			}
-			startStr := "-"
 			if pj.StartTime != nil {
-				startStr = *pj.StartTime
+				if t, err := time.Parse(tsFmt, *pj.StartTime); err == nil {
+					if earliestStart.IsZero() || t.Before(earliestStart) {
+						earliestStart = t
+					}
+				}
 			}
-			endStr := "-"
 			if pj.EndTime != nil {
-				endStr = *pj.EndTime
+				if t, err := time.Parse(tsFmt, *pj.EndTime); err == nil {
+					if latestEnd.IsZero() || t.After(latestEnd) {
+						latestEnd = t
+					}
+				}
 			}
-			fmt.Printf("  %-20s  state=%-10s  started %s, finished %s%s\n",
-				pj.PartitionName, pj.State, startStr, endStr, durStr)
+		}
+		fmt.Println("--- Per-Partition Timing ---")
+		fmt.Printf("  Jobs: %d", len(result.PartitionJobs))
+		stateKeys := make([]string, 0, len(stateCounts))
+		for k := range stateCounts {
+			stateKeys = append(stateKeys, k)
+		}
+		sort.Strings(stateKeys)
+		for _, k := range stateKeys {
+			fmt.Printf("  %s=%d", k, stateCounts[k])
+		}
+		fmt.Println()
+		if !earliestStart.IsZero() && !latestEnd.IsZero() {
+			phaseWall := latestEnd.Sub(earliestStart)
+			fmt.Printf("  Phase wallclock: start=%s  end=%s  wall=%s\n",
+				earliestStart.Format(tsFmt), latestEnd.Format(tsFmt),
+				phaseWall.Round(time.Millisecond))
+		}
+		if len(durations) > 0 {
+			var sum time.Duration
+			minD, maxD := durations[0], durations[0]
+			for _, d := range durations {
+				sum += d
+				if d < minD {
+					minD = d
+				}
+				if d > maxD {
+					maxD = d
+				}
+			}
+			avg := sum / time.Duration(len(durations))
+			fmt.Printf("  Per-partition duration: avg=%s min=%s max=%s sum=%s\n",
+				avg.Round(time.Millisecond), minD.Round(time.Millisecond),
+				maxD.Round(time.Millisecond), sum.Round(time.Millisecond))
 		}
 		fmt.Println()
 	}
@@ -182,23 +247,32 @@ func printSummary(result *ProfileResult) {
 		fmt.Println()
 	}
 
-	// Session variables
-	if len(result.SessionVars) > 0 {
-		fmt.Println("--- Session Variables (stats-related) ---")
-		keys := make([]string, 0, len(result.SessionVars))
-		for k := range result.SessionVars {
-			keys = append(keys, k)
+
+	// Stats extraction.
+	// SHOW STATS_HISTOGRAMS reads TiDB's in-memory stats cache, which evicts
+	// under pressure and returns zero buckets/TopN for evicted columns. The
+	// stats_dump.json HTTP endpoint reads the authoritative on-disk tables
+	// and is always complete — prefer it.
+	if cols, idxs, rc, ok := loadStatsFromDump(result.RunDir); ok {
+		fmt.Println("--- Stats Extraction (from stats_dump.json) ---")
+		fmt.Printf("  Row count: %d\n", rc)
+		if len(cols) > 0 {
+			fmt.Printf("  Column stats (%d columns):\n", len(cols))
+			for _, cs := range cols {
+				fmt.Printf("    %-20s NDV=%-10d NullCount=%-8d TopN=%d Buckets=%d\n",
+					cs.name, cs.ndv, cs.nullCount, cs.topN, cs.buckets)
+			}
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Printf("  %s = %s\n", k, result.SessionVars[k])
+		if len(idxs) > 0 {
+			fmt.Printf("  Index stats (%d indexes):\n", len(idxs))
+			for _, is := range idxs {
+				fmt.Printf("    %-20s NDV=%-10d NullCount=%-8d TopN=%d Buckets=%d\n",
+					is.name, is.ndv, is.nullCount, is.topN, is.buckets)
+			}
 		}
 		fmt.Println()
-	}
-
-	// Stats extraction
-	if result.Accuracy != nil {
-		fmt.Println("--- Stats Extraction ---")
+	} else if result.Accuracy != nil {
+		fmt.Println("--- Stats Extraction (from evictable cache — counts may under-report) ---")
 		rc := result.Accuracy.RowCount
 		fmt.Printf("  Row count: stats=%d actual=%d ratio=%.4f\n", rc.StatsCount, rc.ActualCount, rc.Ratio)
 		if len(result.Accuracy.ColumnStats) > 0 {
@@ -218,15 +292,76 @@ func printSummary(result *ProfileResult) {
 		fmt.Println()
 	}
 
-	// Output files
-	fmt.Println("--- Output Files ---")
-	fmt.Printf("  %s/profile_result.json\n", result.RunDir)
-	for _, f := range result.PprofFiles.HeapFiles {
-		fmt.Printf("  %s\n", f)
+	fmt.Printf("Output: %s\n", result.RunDir)
+}
+
+type statsDumpSummary struct {
+	name      string
+	ndv       int64
+	nullCount int64
+	topN      int
+	buckets   int
+}
+
+// loadStatsFromDump reads stats_dump.json (the HTTP /stats/dump endpoint
+// output) and returns a per-column/per-index summary that isn't subject to
+// TiDB's in-memory cache eviction. Returns ok=false if the file is missing.
+//
+// For partitioned tables the top-level columns/count are empty — the global
+// stats live under partitions["global"]. Prefer that when it exists, fall
+// back to the top-level entries for non-partitioned tables.
+func loadStatsFromDump(runDir string) (cols, idxs []statsDumpSummary, rowCount int64, ok bool) {
+	f, err := os.Open(runDir + "/stats_dump.json")
+	if err != nil {
+		return nil, nil, 0, false
 	}
-	for _, f := range result.PprofFiles.CPUFiles {
-		fmt.Printf("  %s\n", f)
+	defer f.Close()
+	type scope struct {
+		Count   int64                      `json:"count"`
+		Columns map[string]json.RawMessage `json:"columns"`
+		Indices map[string]json.RawMessage `json:"indices"`
 	}
+	var dump struct {
+		scope
+		Partitions map[string]scope `json:"partitions"`
+	}
+	if err := json.NewDecoder(f).Decode(&dump); err != nil {
+		return nil, nil, 0, false
+	}
+	src := dump.scope
+	if g, has := dump.Partitions["global"]; has && (g.Count > 0 || len(g.Columns) > 0 || len(g.Indices) > 0) {
+		src = g
+	}
+	extract := func(m map[string]json.RawMessage) []statsDumpSummary {
+		var out []statsDumpSummary
+		for name, raw := range m {
+			var entry struct {
+				NullCount int64 `json:"null_count"`
+				Histogram struct {
+					NDV     int64             `json:"ndv"`
+					Buckets []json.RawMessage `json:"buckets"`
+				} `json:"histogram"`
+				CMSketch struct {
+					TopN []json.RawMessage `json:"top_n"`
+				} `json:"cm_sketch"`
+			}
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				continue
+			}
+			out = append(out, statsDumpSummary{
+				name:      name,
+				ndv:       entry.Histogram.NDV,
+				nullCount: entry.NullCount,
+				topN:      len(entry.CMSketch.TopN),
+				buckets:   len(entry.Histogram.Buckets),
+			})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+		return out
+	}
+	cols = extract(src.Columns)
+	idxs = extract(src.Indices)
+	return cols, idxs, src.Count, true
 }
 
 func formatBytes(b float64) string {

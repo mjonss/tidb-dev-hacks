@@ -48,6 +48,12 @@ var tidbMetricNames = []string{
 	"go_memstats_heap_alloc_bytes",
 	"go_memstats_heap_inuse_bytes",
 	"go_goroutines",
+	// Scheduler runqueue latency — exposes how long goroutines waited
+	// before getting on-CPU.
+	"go_sched_latencies_seconds_count",
+	"go_sched_latencies_seconds_sum",
+	"go_gc_duration_seconds_count",
+	"go_gc_duration_seconds_sum",
 	"tidb_statistics_auto_analyze_total",
 	"tidb_statistics_stats_inaccuracy_rate",
 	"tidb_session_execute_duration_seconds_count",
@@ -56,6 +62,8 @@ var tidbMetricNames = []string{
 	"tidb_distsql_handle_query_duration_seconds_sum",
 	"tidb_distsql_scan_keys_num_count",
 	"tidb_distsql_scan_keys_num_sum",
+	"tidb_executor_statement_duration_seconds_count",
+	"tidb_executor_statement_duration_seconds_sum",
 }
 
 // tikvMetricNames are the metric prefixes we look for in TiKV /metrics.
@@ -69,6 +77,10 @@ var tikvMetricNames = []string{
 	"tikv_coprocessor_request_duration_seconds_sum",
 	"tikv_coprocessor_scan_keys_count",
 	"tikv_coprocessor_scan_keys_sum",
+	// Scheduler / write-path timing — exposes server-side stage waits
+	// when the ANALYZE is writing back stats.
+	"tikv_scheduler_command_duration_seconds_count",
+	"tikv_scheduler_command_duration_seconds_sum",
 }
 
 // AnalyzeJobsPoller polls mysql.analyze_jobs for the target table.
@@ -494,6 +506,178 @@ func (p *PprofCollector) HeapFiles() []string {
 	out := make([]string, len(p.heapFiles))
 	copy(out, p.heapFiles)
 	return out
+}
+
+// GoroutineCollector polls /debug/pprof/goroutine?debug=1 and buckets the
+// goroutines by their wait reason to produce a cheap, high-signal timeline
+// of how TiDB spent its wallclock. The HTTP call is near-free (sub-50 ms
+// even with thousands of goroutines).
+type GoroutineCollector struct {
+	cfg       *Config
+	outputDir string
+	mu        sync.Mutex
+	samples   []GoroutineSample
+	files     []string
+	stopCh    chan struct{}
+	done      chan struct{}
+}
+
+// GoroutineSample is one snapshot of the goroutine dump, with per-state counts.
+type GoroutineSample struct {
+	Timestamp   time.Time      `json:"timestamp"`
+	Total       int            `json:"total"`
+	ByState     map[string]int `json:"by_state"`
+	DumpFile    string         `json:"dump_file"`
+}
+
+func NewGoroutineCollector(cfg *Config, outputDir string) *GoroutineCollector {
+	return &GoroutineCollector{
+		cfg:       cfg,
+		outputDir: outputDir,
+		stopCh:    make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+}
+
+func (g *GoroutineCollector) Start() {
+	go func() {
+		defer close(g.done)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		g.capture(0)
+		idx := 1
+		for {
+			select {
+			case <-g.stopCh:
+				g.capture(idx)
+				return
+			case <-ticker.C:
+				g.capture(idx)
+				idx++
+			}
+		}
+	}()
+}
+
+func (g *GoroutineCollector) Stop() {
+	close(g.stopCh)
+	<-g.done
+}
+
+func (g *GoroutineCollector) Samples() []GoroutineSample {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]GoroutineSample, len(g.samples))
+	copy(out, g.samples)
+	return out
+}
+
+func (g *GoroutineCollector) Files() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]string, len(g.files))
+	copy(out, g.files)
+	return out
+}
+
+func (g *GoroutineCollector) capture(idx int) {
+	// debug=2 gives one goroutine per entry with its state in brackets,
+	// which is what summarizeGoroutineDump parses.
+	url := fmt.Sprintf("%s/debug/pprof/goroutine?debug=2", g.cfg.StatusURL())
+	path := fmt.Sprintf("%s/goroutine_%d.txt", g.outputDir, idx)
+	if err := downloadFile(url, path, 10*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: goroutine snapshot %d failed: %v\n", idx, err)
+		return
+	}
+	counts, total, err := summarizeGoroutineDump(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: parse goroutine dump %d: %v\n", idx, err)
+	}
+	sample := GoroutineSample{
+		Timestamp: time.Now(),
+		Total:     total,
+		ByState:   counts,
+		DumpFile:  path,
+	}
+	g.mu.Lock()
+	g.samples = append(g.samples, sample)
+	g.files = append(g.files, path)
+	g.mu.Unlock()
+}
+
+// summarizeGoroutineDump parses a debug=1 goroutine dump and counts goroutines
+// per state. The dump format is:
+//   goroutine 42 [semacquire, 1 minutes]:
+//   <stack frames...>
+// We group "IO wait", "chan receive", "chan send", "select", "semacquire",
+// "sync.Cond.Wait", "syscall", "runnable", "running", "sleep", etc.
+func summarizeGoroutineDump(path string) (map[string]int, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	counts := make(map[string]int)
+	total := 0
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "goroutine ") {
+			continue
+		}
+		// "goroutine 42 [chan receive, 1 minutes]:" → state "chan receive"
+		lb := strings.IndexByte(line, '[')
+		rb := strings.IndexByte(line, ']')
+		if lb < 0 || rb < 0 || rb <= lb {
+			continue
+		}
+		state := line[lb+1 : rb]
+		// Strip the ", 1 minutes" suffix some states have.
+		if comma := strings.IndexByte(state, ','); comma >= 0 {
+			state = state[:comma]
+		}
+		counts[state]++
+		total++
+	}
+	return counts, total, scanner.Err()
+}
+
+// MutexProfileCollector grabs /debug/pprof/mutex before and after ANALYZE.
+// TiDB already runs SetMutexProfileFraction(10) at startup, so these
+// profiles are populated with ~zero added overhead. The delta (after - before)
+// isolates contention that happened during ANALYZE.
+type MutexProfileCollector struct {
+	cfg       *Config
+	outputDir string
+	beforeF   string
+	afterF    string
+}
+
+func NewMutexProfileCollector(cfg *Config, outputDir string) *MutexProfileCollector {
+	return &MutexProfileCollector{cfg: cfg, outputDir: outputDir}
+}
+
+func (m *MutexProfileCollector) CaptureBefore() {
+	m.beforeF = fmt.Sprintf("%s/mutex_before.pb.gz", m.outputDir)
+	url := fmt.Sprintf("%s/debug/pprof/mutex", m.cfg.StatusURL())
+	if err := downloadFile(url, m.beforeF, 10*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: mutex profile (before) failed: %v\n", err)
+		m.beforeF = ""
+	}
+}
+
+func (m *MutexProfileCollector) CaptureAfter() {
+	m.afterF = fmt.Sprintf("%s/mutex_after.pb.gz", m.outputDir)
+	url := fmt.Sprintf("%s/debug/pprof/mutex", m.cfg.StatusURL())
+	if err := downloadFile(url, m.afterF, 10*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: mutex profile (after) failed: %v\n", err)
+		m.afterF = ""
+	}
+}
+
+func (m *MutexProfileCollector) Files() (before, after string) {
+	return m.beforeF, m.afterF
 }
 
 func downloadFile(url, path string, timeout time.Duration) error {
