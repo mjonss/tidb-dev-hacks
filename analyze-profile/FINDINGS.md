@@ -198,38 +198,87 @@ NewHistogram: 53 MB
 3. **sync.Pool churn** (~87 MB): bucket4Merging pool pressure from
    the ~2M allocations + releases.
 
-### Future optimization: pointer-based merge (prototyped, not landed)
+### Pointer-based merge + sorted merge-walk (landed)
 
-Replaces bucket4Merging structs (~800 MB) with a sorted array of
-`bucketRef{histIdx uint16, bucketIdx uint16}` pointers (~8 MB). Sort
-comparisons read bounds directly from the original Histogram chunks —
-zero Datum copies, zero struct allocation.
+Complete rewrite of `MergePartTopNAndHistToGlobal` across multiple
+commits (f9c3b55b67 through 74557f8a80). Replaces bucket4Merging,
+counter map, sorted TopNMeta slice, and mergeByUpperBound with:
 
-Prototype passed `TestMerge*` tests but failed `TestGlobalStatsData*`
-because the simplified equi-depth Phase 5 doesn't handle the bucket
-overlap splitting that `mergeByUpperBound` does (fraction calculation
-for partition buckets with overlapping value ranges). Needs the overlap
-logic integrated into the pointer-based walk.
+- `bucketRef` pointers (~8 MB vs ~800 MB bucket4Merging)
+- Sorted merge-walk of TopN entries + histogram refs
+- Bounded min-heap for global TopN selection (~4 KB vs ~80 MB candidates)
+- Leftover TopN values injected inline during equi-depth walk
 
-Expected savings if completed:
+All `TestMerge*` and `TestMergeGlobalTopN` integration tests pass.
 
-| | Fix #2 only | + pointer refactor | BASE |
+**Quick run results (8000 partitions, 30M rows, 17 columns):**
+
+| Run | Duration | Peak Heap | Peak RSS |
 |---|---|---|---|
-| bucket4Merging | ~400 MB | **~8 MB** | 427 MB |
-| Datum copies | ~320 MB | **~0 MB** | ~320 MB |
-| codec.EncodeKey | 267 MB | **~0 MB** | — |
-| sorted TopNMeta | ~491 MB | ~491 MB | — |
-| **Total merge overhead** | **~1500 MB** | **~500 MB** | **768 MB** |
+| **PR pointer-refactor** | 1410s (23.5 min) | **2.19 GB** | **3.18 GB** |
+| PR before refactor | 1474s (24.6 min) | 11.63 GB | 12.61 GB |
+| BASE | 1438s (24.0 min) | 4.45 GB | 5.11 GB |
 
-This would make the PR **better than BASE** on memory — 500 MB vs
-768 MB — while also being O(P×T) instead of BASE's O(P²×T) for TopN.
+Peak heap: **2.19 GB** — below BASE's 4.45 GB. GC sawtooth peak also
+much lower (~2.19 GB vs ~11.63 GB previously, ~4.45 GB BASE).
+
+### CPU bottleneck: GetUpper in the sort comparator
+
+The merge phase took ~6 minutes (from SHOW ANALYZE STATUS). CPU profiling
+shows the `bucketRef` sort comparator spending **68% of its time in
+`GetUpper`** — extracting Datums from Histogram Chunks via double
+indirection (`refs[i] → hists[histIdx] → Bounds.GetRow()`):
+
+```
+From cpu_profile_129 (peak merge activity, 10s sample):
+
+ 30ms  970ms  hists[a.histIdx].GetUpper(int(a.bucketIdx))   ← 35%
+ 30ms  900ms  hists[b.histIdx].GetUpper(int(b.bucketIdx))   ← 33%
+ 90ms  750ms  ua.Compare(...)                                ← 27%
+```
+
+~84M GetUpper calls per column × 17 columns = ~1.4 billion indirect
+Chunk lookups. BASE's `bucket4Merging` sort compares `.upper` Datum
+pointers directly — no indirection, better cache locality.
+
+### Next optimization: k-way merge (not yet implemented)
+
+Each partition's histogram already has its buckets sorted by upper
+bound. Instead of flattening 2M refs + sorting, do a k-way merge of
+8000 pre-sorted sequences using a min-heap of size K=8000.
+
+| | Current sort | K-way merge |
+|---|---|---|
+| Comparisons per column | ~42M (O(N log N)) | ~26M (O(N log K)) |
+| GetUpper calls per column | **~84M** (2 per cmp) | **~2M** (1 per element, cached in heap) |
+| GetUpper calls total (17 cols) | **~1.4 billion** | **~34M** |
+| Heap memory | — | ~400 KB |
+
+The k-way merge stores each partition's current Datum in the heap
+entry (extracted once when the element enters the heap). Sift
+operations compare cached Datums — no GetUpper calls during
+comparisons. **42× reduction in GetUpper calls.**
+
+Additionally, the k-way merge produces elements in sorted order,
+so it can feed directly into the equi-depth accumulator — no
+separate sort step, no refs array needed.
 
 ## PR commits applied
 
 | Commit | Description | Status |
 |---|---|---|
-| `7a7a50c7f4` | Reuse encode buffer in Phase 2 | **Reverted** in next commit (unsafe with hack.String) |
-| `2d460033af` | Eliminate double bucket4Merging for Repeat values | **Landed**, all `TestMerge*` pass |
+| `f9c3b55b67` | Pointer-based merge (bucketRef) | **Landed** |
+| `8299c6b47a` | Sorted merge-walk, eliminate counter map | **Landed** |
+| `fcb7ed0f78` | Nil histogram safety | **Landed** |
+| `10063ec866` | Bounded min-heap for TopN selection | **Landed** |
+| `137f871a2a` | Remove repeatFromHist map | **Landed** |
+| `71996937be` | Merge leftovers into Pass 2, remove mergeByUpperBound | **Landed** |
+| `fef7a3ed27` | Reuse allTopN in Pass 2, eliminate leftovers slice | **Landed** |
+| `2e8cd3d5e3` | Early return, flatten indent | **Landed** |
+| `74557f8a80` | Fix stale comments | **Landed** |
+| `11733c6581` | O(1) TopN lookup with reusable encode buffer | **Landed** |
+| `27f3bd85bc` | Reuse decoded TopN Datum | **Landed** |
+| `cf836320c5` | Simplify totCount loop | **Landed** |
 
 Pre-existing test failures on the PR branch (not caused by our changes):
 TestGlobalStatsData2, TestGlobalStatsData3, TestGlobalIndexStatistics,
@@ -239,11 +288,12 @@ TestGlobalStatsMergeCombined — these fail both before and after our commits.
 
 - [x] Investigate why PR async=ON retains ~2x more live objects
 - [x] Add ?dumpPartitionStats=false to stats dump URL
-- [x] Fix #2: eliminate double bucket4Merging (committed)
-- [ ] Re-run benchmark with fix #2 to verify memory reduction
-- [ ] Fix #1: replace codec.EncodeKey with Datum binary-search approach
-- [ ] Pointer-based merge refactoring (needs overlap handling in equi-depth)
-- [ ] Address sorted TopNMeta slice allocation (~491 MB)
+- [x] Fix #2: eliminate double bucket4Merging
+- [x] Pointer-based merge refactoring (all tests pass)
+- [x] Sorted merge-walk eliminating counter map + candidates slice
+- [x] Bounded min-heap for TopN selection
+- [x] Re-run quick benchmark to verify memory reduction
+- [ ] Implement k-way merge to eliminate sort bottleneck (~6 min merge → est. ~1-2 min)
 - [ ] Re-run full matrix with all fixes
 - [ ] Verify "existing" runs complete without OOM at 16 GB
 - [ ] Review TiDB logs for warnings/errors
