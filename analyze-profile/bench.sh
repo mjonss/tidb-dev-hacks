@@ -400,6 +400,7 @@ run_one_profile() {
     ${part_flag} \
     ${stats_flag} \
     --check-accuracy \
+    --verbose \
     --cpu-profile-seconds "${CPU_PROFILE_SECONDS}" \
     --output-dir "${out_dir}" \
     "${analyze_columns_flag[@]}" \

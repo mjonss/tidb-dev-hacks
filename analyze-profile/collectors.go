@@ -14,6 +14,36 @@ import (
 	"time"
 )
 
+// verboseLog writes a timestamped debug line to the verbose log file (if set).
+// Used by collectors to log capture durations without cluttering stderr.
+var verboseLogFile *os.File
+
+func initVerboseLog(runDir string) {
+	path := fmt.Sprintf("%s/collector_debug.log", runDir)
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot create verbose log: %v\n", err)
+		return
+	}
+	verboseLogFile = f
+	vlog("verbose logging started")
+}
+
+func closeVerboseLog() {
+	if verboseLogFile != nil {
+		verboseLogFile.Close()
+		verboseLogFile = nil
+	}
+}
+
+func vlog(format string, args ...interface{}) {
+	if verboseLogFile == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(verboseLogFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), msg)
+}
+
 // AnalyzeJobSnapshot represents one row from mysql.analyze_jobs at a point in time.
 type AnalyzeJobSnapshot struct {
 	PollTime      time.Time `json:"poll_time"`
@@ -105,7 +135,7 @@ func NewAnalyzeJobsPoller(db *sql.DB, cfg *Config) *AnalyzeJobsPoller {
 func (p *AnalyzeJobsPoller) Start() {
 	go func() {
 		defer close(p.done)
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -120,6 +150,7 @@ func (p *AnalyzeJobsPoller) Start() {
 }
 
 func (p *AnalyzeJobsPoller) poll() {
+	t0 := time.Now()
 	query := `SELECT id, table_schema, table_name, partition_name, job_info,
 		processed_rows, state, start_time, end_time, IFNULL(fail_reason, '')
 		FROM mysql.analyze_jobs
@@ -128,12 +159,13 @@ func (p *AnalyzeJobsPoller) poll() {
 
 	rows, err := p.db.Query(query, p.cfg.DB, p.cfg.Table)
 	if err != nil {
-		// Silently skip — table may not exist or be different schema
+		vlog("analyze_jobs poll failed: %v", err)
 		return
 	}
 	defer rows.Close()
 
 	now := time.Now()
+	n := 0
 	for rows.Next() {
 		var snap AnalyzeJobSnapshot
 		snap.PollTime = now
@@ -145,7 +177,9 @@ func (p *AnalyzeJobsPoller) poll() {
 		p.mu.Lock()
 		p.snapshots = append(p.snapshots, snap)
 		p.mu.Unlock()
+		n++
 	}
+	vlog("analyze_jobs poll: %dms (%d rows)", time.Since(t0).Milliseconds(), n)
 }
 
 func (p *AnalyzeJobsPoller) Stop() {
@@ -198,6 +232,7 @@ func (m *MetricsPoller) Start() {
 }
 
 func (m *MetricsPoller) scrape() {
+	start := time.Now()
 	// TiDB metrics
 	tidbSample := scrapeMetrics(m.cfg.StatusURL()+"/metrics", tidbMetricNames)
 	if tidbSample != nil {
@@ -222,6 +257,7 @@ func (m *MetricsPoller) scrape() {
 			m.mu.Unlock()
 		}
 	}
+	vlog("metrics scrape: %dms", time.Since(start).Milliseconds())
 }
 
 func (m *MetricsPoller) discoverTiKVHosts() []string {
@@ -436,9 +472,41 @@ func (p *PprofCollector) CaptureHeap(path string) error {
 	return downloadFile(url, path, 30*time.Second)
 }
 
-// StartLoop captures CPU and heap profiles in a loop until stopped.
-// A heap snapshot is taken before each CPU profile starts.
+// StartLoop captures CPU profiles in a loop, and heap snapshots on a fast
+// 2-second ticker (independent of the CPU profile cadence). The fast heap
+// captures are needed because the GC sawtooth cycle on large ANALYZE runs
+// is ~6-12 seconds — a 10s-cadence heap capture (tied to the CPU profile)
+// consistently misses the pre-GC peak.
 func (p *PprofCollector) StartLoop(ctx context.Context) {
+	// Fast heap ticker — captures every 2s, same cadence as the metrics
+	// poller, so heap peaks visible in the metrics also have a matching
+	// pprof snapshot.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		idx := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.stopCh:
+				return
+			case <-ticker.C:
+				heapPath := fmt.Sprintf("%s/heap_%d.pb.gz", p.outputDir, idx)
+				t0 := time.Now()
+				if err := p.CaptureHeap(heapPath); err != nil {
+					continue
+				}
+				vlog("heap snapshot %d: %dms", idx, time.Since(t0).Milliseconds())
+				p.mu.Lock()
+				p.heapFiles = append(p.heapFiles, heapPath)
+				p.mu.Unlock()
+				idx++
+			}
+		}
+	}()
+
+	// CPU profile loop — each profile takes CPUProfileSeconds.
 	go func() {
 		defer close(p.done)
 		idx := 0
@@ -451,20 +519,10 @@ func (p *PprofCollector) StartLoop(ctx context.Context) {
 			default:
 			}
 
-			// Heap snapshot
-			heapPath := fmt.Sprintf("%s/heap_%d.pb.gz", p.outputDir, idx)
-			if err := p.CaptureHeap(heapPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: heap snapshot %d failed: %v\n", idx, err)
-			} else {
-				p.mu.Lock()
-				p.heapFiles = append(p.heapFiles, heapPath)
-				p.mu.Unlock()
-			}
-
-			// CPU profile
 			cpuPath := fmt.Sprintf("%s/cpu_profile_%d.pb.gz", p.outputDir, idx)
 			url := fmt.Sprintf("%s/debug/pprof/profile?seconds=%d", p.cfg.StatusURL(), p.cfg.CPUProfileSeconds)
 
+			t0 := time.Now()
 			err := downloadFile(url, cpuPath, time.Duration(p.cfg.CPUProfileSeconds+30)*time.Second)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: CPU profile %d failed: %v\n", idx, err)
@@ -479,6 +537,7 @@ func (p *PprofCollector) StartLoop(ctx context.Context) {
 				continue
 			}
 
+			vlog("cpu profile %d: %dms", idx, time.Since(t0).Milliseconds())
 			p.mu.Lock()
 			p.cpuFiles = append(p.cpuFiles, cpuPath)
 			p.mu.Unlock()
@@ -585,10 +644,12 @@ func (g *GoroutineCollector) capture(idx int) {
 	// which is what summarizeGoroutineDump parses.
 	url := fmt.Sprintf("%s/debug/pprof/goroutine?debug=2", g.cfg.StatusURL())
 	path := fmt.Sprintf("%s/goroutine_%d.txt", g.outputDir, idx)
+	t0 := time.Now()
 	if err := downloadFile(url, path, 10*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: goroutine snapshot %d failed: %v\n", idx, err)
 		return
 	}
+	vlog("goroutine snapshot %d: %dms", idx, time.Since(t0).Milliseconds())
 	counts, total, err := summarizeGoroutineDump(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: parse goroutine dump %d: %v\n", idx, err)
@@ -663,19 +724,23 @@ func NewMutexProfileCollector(cfg *Config, outputDir string) *MutexProfileCollec
 func (m *MutexProfileCollector) CaptureBefore() {
 	m.beforeF = fmt.Sprintf("%s/mutex_before.pb.gz", m.outputDir)
 	url := fmt.Sprintf("%s/debug/pprof/mutex", m.cfg.StatusURL())
+	t0 := time.Now()
 	if err := downloadFile(url, m.beforeF, 10*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: mutex profile (before) failed: %v\n", err)
 		m.beforeF = ""
 	}
+	vlog("mutex profile (before): %dms", time.Since(t0).Milliseconds())
 }
 
 func (m *MutexProfileCollector) CaptureAfter() {
 	m.afterF = fmt.Sprintf("%s/mutex_after.pb.gz", m.outputDir)
 	url := fmt.Sprintf("%s/debug/pprof/mutex", m.cfg.StatusURL())
+	t0 := time.Now()
 	if err := downloadFile(url, m.afterF, 10*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: mutex profile (after) failed: %v\n", err)
 		m.afterF = ""
 	}
+	vlog("mutex profile (after): %dms", time.Since(t0).Milliseconds())
 }
 
 func (m *MutexProfileCollector) Files() (before, after string) {

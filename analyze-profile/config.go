@@ -47,6 +47,7 @@ type Config struct {
 	DropStats         bool
 	TruncateStats     bool
 	CheckAccuracy     bool
+	Verbose           bool
 }
 
 func (c *Config) DSN() string {
@@ -211,4 +212,5 @@ func RegisterProfileFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.BoolVar(&cfg.DropStats, "drop-stats", false, "Drop table statistics before running ANALYZE")
 	fs.BoolVar(&cfg.TruncateStats, "truncate-stats", false, "Truncate all mysql.stats_* tables before running ANALYZE (affects all tables in cluster)")
 	fs.BoolVar(&cfg.CheckAccuracy, "check-accuracy", false, "After ANALYZE, compare stats estimates vs actual counts for range queries")
+	fs.BoolVar(&cfg.Verbose, "verbose", false, "Log collection timings (heap/cpu/goroutine/mutex/metrics capture durations)")
 }

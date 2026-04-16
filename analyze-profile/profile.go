@@ -33,6 +33,11 @@ func runProfile(cfg *Config) error {
 	}
 	fmt.Fprintf(os.Stderr, "Output dir: %s\n", runDir)
 
+	if cfg.Verbose {
+		initVerboseLog(runDir)
+		defer closeVerboseLog()
+	}
+
 	// Connect
 	db, err := sql.Open("mysql", cfg.DSN())
 	if err != nil {
@@ -155,6 +160,7 @@ func runProfile(cfg *Config) error {
 	mutexCollector.CaptureAfter()
 
 	// Final heap snapshot after ANALYZE
+	t0 := time.Now()
 	finalHeapPath := fmt.Sprintf("%s/heap_%d.pb.gz", runDir, len(pprofCollector.HeapFiles()))
 	if err := pprofCollector.CaptureHeap(finalHeapPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: final heap snapshot failed: %v\n", err)
@@ -163,24 +169,33 @@ func runProfile(cfg *Config) error {
 		pprofCollector.heapFiles = append(pprofCollector.heapFiles, finalHeapPath)
 		pprofCollector.mu.Unlock()
 	}
+	vlog("final heap snapshot: %dms", time.Since(t0).Milliseconds())
 
 	// Capture "after" analyze status
+	t0 = time.Now()
 	analyzeStatus := captureAnalyzeStatus(db, cfg)
+	vlog("captureAnalyzeStatus: %dms (%d entries)", time.Since(t0).Milliseconds(), len(analyzeStatus))
 
 	// Dump table statistics (non-fatal on error)
+	t0 = time.Now()
 	dumpTableStats(db, cfg, runDir)
+	vlog("dumpTableStats: %dms", time.Since(t0).Milliseconds())
 
 	// Build per-partition job summaries from the final analyze status
 	partitionJobs := buildPartitionJobs(analyzeStatus)
 
 	// Query slow_query
+	t0 = time.Now()
 	slowQueries := querySlowQueries(db, cfg, startTime)
+	vlog("querySlowQueries: %dms (%d entries)", time.Since(t0).Milliseconds(), len(slowQueries))
 
 	// Accuracy check (if requested and ANALYZE succeeded)
 	var accuracyResult *AccuracyResult
 	if cfg.CheckAccuracy && analyzeErr == nil {
+		t0 = time.Now()
 		var err error
 		accuracyResult, err = checkAccuracy(db, cfg)
+		vlog("checkAccuracy: %dms", time.Since(t0).Milliseconds())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: accuracy check failed: %v\n", err)
 		}
@@ -313,6 +328,7 @@ func dropStats(db *sql.DB, cfg *Config) error {
 
 	fmt.Fprintf(os.Stderr, "Dropping statistics for %s.%s...", cfg.DB, cfg.Table)
 	dropStart := time.Now()
+	vlog("dropStats: starting")
 
 	// Fetch partition names.
 	rows, err := db.Query(
@@ -354,7 +370,9 @@ func dropStats(db *sql.DB, cfg *Config) error {
 		return fmt.Errorf("drop stats (global): %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, " done in %s (%d partitions)\n", time.Since(dropStart).Round(100*time.Millisecond), len(partitions))
+	elapsed := time.Since(dropStart).Round(100 * time.Millisecond)
+	fmt.Fprintf(os.Stderr, " done in %s (%d partitions)\n", elapsed, len(partitions))
+	vlog("dropStats: %dms (%d partitions)", elapsed.Milliseconds(), len(partitions))
 	return nil
 }
 
@@ -484,11 +502,13 @@ func dumpTableStats(db *sql.DB, cfg *Config, runDir string) {
 	}
 
 	for _, d := range dumps {
+		t0 := time.Now()
 		if err := dumpQueryToTSV(db, d.query, fmt.Sprintf("%s/%s", runDir, d.filename)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: dump %s failed: %v\n", d.filename, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "Wrote %s/%s\n", runDir, d.filename)
 		}
+		vlog("dump %s: %dms", d.filename, time.Since(t0).Milliseconds())
 	}
 
 	// HTTP stats dump. For partitioned tables with thousands of partitions,
@@ -496,10 +516,18 @@ func dumpTableStats(db *sql.DB, cfg *Config, runDir string) {
 	// enough; allow up to 10 minutes.
 	statsURL := fmt.Sprintf("%s/stats/dump/%s/%s", cfg.StatusURL(), cfg.DB, cfg.Table)
 	statsPath := fmt.Sprintf("%s/stats_dump.json", runDir)
+	t0 := time.Now()
 	if err := downloadFile(statsURL, statsPath, 10*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: stats dump from %s failed: %v\n", statsURL, err)
+		vlog("stats_dump.json download FAILED after %dms: %v", time.Since(t0).Milliseconds(), err)
 	} else {
+		fi, _ := os.Stat(statsPath)
+		size := int64(0)
+		if fi != nil {
+			size = fi.Size()
+		}
 		fmt.Fprintf(os.Stderr, "Wrote %s\n", statsPath)
+		vlog("stats_dump.json download: %dms (%d bytes)", time.Since(t0).Milliseconds(), size)
 	}
 }
 

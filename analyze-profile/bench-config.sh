@@ -24,7 +24,7 @@ TIDB_NUM=1
 # ${OUTPUT_ROOT}/configs/ and passes them via --db.config / --kv.config /
 # --pd.config. Set any of {TIDB,TIKV,PD}_CONFIG to override with your own
 # toml instead of letting the script render one.
-TIDB_MEM_GB="${TIDB_MEM_GB:-8}"           # TiDB performance.server-memory-quota
+TIDB_MEM_GB="${TIDB_MEM_GB:-16}"          # TiDB performance.server-memory-quota
 TIKV_MEM_GB="${TIKV_MEM_GB:-8}"           # TiKV memory.memory-usage-limit
 TIKV_BLOCK_CACHE_GB="${TIKV_BLOCK_CACHE_GB:-3}"   # TiKV block-cache.capacity
 PD_MEM_FRACTION="${PD_MEM_FRACTION:-0.125}"       # PD server-memory-limit (0-1)
