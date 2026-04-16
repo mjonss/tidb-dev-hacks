@@ -488,10 +488,16 @@ def main():
             sys.exit("--group needs LABEL DIR [DIR...]")
         label, dirs = g[0], g[1:]
         runs = [load(d) for d in dirs]
-        runs = [r for r in runs if r]
+        missing = sum(1 for r in runs if r is None)
+        runs = [r for r in runs if r is not None]
         if not runs:
-            print(f"  (warn: group {label} has no accuracy data)", file=sys.stderr)
+            print(f"  (warn: group {label} has no accuracy data — "
+                  f"all {missing} run(s) missing; ANALYZE may have OOM'd "
+                  f"or stats_dump.json timed out)", file=sys.stderr)
             continue
+        if missing:
+            print(f"  (note: group {label}: {missing} of {missing+len(runs)} "
+                  f"run(s) missing accuracy data)", file=sys.stderr)
         groups.append((label, fold_runs(runs)))
 
     for label, g in groups:

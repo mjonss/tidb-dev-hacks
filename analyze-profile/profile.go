@@ -469,10 +469,12 @@ func dumpTableStats(db *sql.DB, cfg *Config, runDir string) {
 		}
 	}
 
-	// HTTP stats dump
+	// HTTP stats dump. For partitioned tables with thousands of partitions,
+	// this endpoint returns a very large JSON (hundreds of MB). 60s is not
+	// enough; allow up to 10 minutes.
 	statsURL := fmt.Sprintf("%s/stats/dump/%s/%s", cfg.StatusURL(), cfg.DB, cfg.Table)
 	statsPath := fmt.Sprintf("%s/stats_dump.json", runDir)
-	if err := downloadFile(statsURL, statsPath, 60*time.Second); err != nil {
+	if err := downloadFile(statsURL, statsPath, 10*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: stats dump from %s failed: %v\n", statsURL, err)
 	} else {
 		fmt.Fprintf(os.Stderr, "Wrote %s\n", statsPath)

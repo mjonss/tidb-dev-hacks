@@ -143,6 +143,22 @@ find_playground_data_dir() {
   printf '%s\n' "${argv}" | sed -nE 's|.*(\.tiup/data/[^/]+)/.*|\1|p' | head -1 || true
 }
 
+# Find the TiDB log file path from the running tidb-server's --log-file arg.
+find_tidb_log_path() {
+  local argv
+  argv=$(pgrep -af 'tidb-server.*--log-file=' 2>/dev/null | head -1 || true)
+  [[ -z "${argv}" ]] && return 0
+  printf '%s\n' "${argv}" | sed -nE 's|.*--log-file=([^ ]+).*|\1|p' | head -1 || true
+}
+
+# Find the TiKV log file path from the running tikv-server's --log-file arg.
+find_tikv_log_path() {
+  local argv
+  argv=$(pgrep -af 'tikv-server.*--log-file=' 2>/dev/null | head -1 || true)
+  [[ -z "${argv}" ]] && return 0
+  printf '%s\n' "${argv}" | sed -nE 's|.*--log-file=([^ ]+).*|\1|p' | head -1 || true
+}
+
 # Wait for port 4000 to be released so the next playground_start doesn't
 # collide. Returns 0 when free, non-zero on timeout.
 wait_port_4000_free() {
@@ -397,6 +413,27 @@ run_one_profile() {
     printf '%s\t%s\t%s\t%s\t%d\t%s\n' \
       "${label}" "${scenario}" "${state}" "${async}" "${iter}" "${inner}" \
       >> "${RUN_MANIFEST}"
+    # Copy TiDB + TiKV logs into the run dir before the next reload
+    # destroys the tiup data dir. Grab current + rotated segments.
+    # Lumberjack (TiDB) rotates tidb.log → tidb-<timestamp>.log, so we
+    # glob on the stem (tidb*) rather than the exact name (tidb.log*).
+    local tidb_log tikv_log
+    tidb_log=$(find_tidb_log_path)
+    if [[ -n "${tidb_log}" && -f "${tidb_log}" ]]; then
+      local log_dir log_stem
+      log_dir=$(dirname "${tidb_log}")
+      log_stem=$(basename "${tidb_log}" .log)   # "tidb" from "tidb.log"
+      mkdir -p "${inner}/tidb-logs"
+      cp "${log_dir}/${log_stem}"*.log* "${inner}/tidb-logs/" 2>/dev/null || true
+    fi
+    tikv_log=$(find_tikv_log_path)
+    if [[ -n "${tikv_log}" && -f "${tikv_log}" ]]; then
+      local log_dir log_stem
+      log_dir=$(dirname "${tikv_log}")
+      log_stem=$(basename "${tikv_log}" .log)   # "tikv" from "tikv.log"
+      mkdir -p "${inner}/tikv-logs"
+      cp "${log_dir}/${log_stem}"*.log* "${inner}/tikv-logs/" 2>/dev/null || true
+    fi
   else
     log "WARN: no run_* dir under ${out_dir}"
   fi
