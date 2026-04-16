@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,15 @@ func vlog(format string, args ...interface{}) {
 	}
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintf(verboseLogFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), msg)
+}
+
+// vlogSelfMemory logs analyze-profile's own heap usage to the verbose log.
+// Called periodically by the metrics poller (piggybacks on its 2s ticker).
+func vlogSelfMemory() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	vlog("self: heap_alloc=%dMB heap_sys=%dMB goroutines=%d",
+		m.HeapAlloc/(1024*1024), m.HeapSys/(1024*1024), runtime.NumGoroutine())
 }
 
 // AnalyzeJobSnapshot represents one row from mysql.analyze_jobs at a point in time.
@@ -178,6 +188,10 @@ func (p *AnalyzeJobsPoller) poll() {
 	defer rows.Close()
 
 	now := time.Now()
+	// Keep only the latest snapshot per job ID — previous implementation
+	// appended every row from every poll, growing to millions of entries
+	// on 8000-partition tables (~5.5M structs / ~2–3 GB over 23 min).
+	latest := make(map[int64]AnalyzeJobSnapshot)
 	n := 0
 	for rows.Next() {
 		var snap AnalyzeJobSnapshot
@@ -187,11 +201,15 @@ func (p *AnalyzeJobsPoller) poll() {
 			&snap.State, &snap.StartTime, &snap.EndTime, &snap.FailReason); err != nil {
 			continue
 		}
-		p.mu.Lock()
-		p.snapshots = append(p.snapshots, snap)
-		p.mu.Unlock()
+		latest[snap.ID] = snap
 		n++
 	}
+	p.mu.Lock()
+	p.snapshots = make([]AnalyzeJobSnapshot, 0, len(latest))
+	for _, snap := range latest {
+		p.snapshots = append(p.snapshots, snap)
+	}
+	p.mu.Unlock()
 	vlog("analyze_jobs poll: %dms (%d rows)", time.Since(t0).Milliseconds(), n)
 }
 
@@ -271,6 +289,7 @@ func (m *MetricsPoller) scrape() {
 		}
 	}
 	vlog("metrics scrape: %dms", time.Since(start).Milliseconds())
+	vlogSelfMemory()
 }
 
 func (m *MetricsPoller) discoverTiKVHosts() []string {
