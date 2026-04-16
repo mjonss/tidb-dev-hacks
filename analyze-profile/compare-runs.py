@@ -795,6 +795,44 @@ def print_multi_comparison(groups):
               f"implied avg concurrency={concurrency:.2f}x "
               f"(min={min(durations):.1f}s, max={max(durations):.1f}s)")
 
+    # --- Noise indicators (TiKV background activity during the run) ---
+    # Non-zero deltas in region splits or compaction during a benchmark run
+    # indicate background work that may have affected timing/memory measurements.
+    noise_metrics = [
+        ("tikv_raftstore_region_split_duration_seconds_count", "region splits"),
+        ("tikv_raftstore_region_split_duration_seconds_sum", "region split time (s)"),
+        ("tikv_engine_compaction_duration_seconds_count", "compactions"),
+        ("tikv_engine_compaction_duration_seconds_sum", "compaction time (s)"),
+        ("tikv_raftstore_region_count", "region count (gauge)"),
+    ]
+    print(f"\n  --- TiKV Noise Indicators (deltas during run, first run per group) ---")
+    header = f"    {'metric':<32}"
+    for label, _ in groups:
+        header += f"  {label:>12}"
+    print(header)
+    any_noise = False
+    for key, display in noise_metrics:
+        line = f"    {display:<32}"
+        has_data = False
+        for _, runs in groups:
+            r = runs[0]
+            d = _tikv_metric_delta(r, key)
+            if d != 0:
+                has_data = True
+            if key.endswith("_sum"):
+                line += f"  {d:>12.3f}"
+            elif key == "tikv_raftstore_region_count":
+                # Gauge — show last value, not delta. Delta of a gauge is
+                # meaningful too (growth = splits happened).
+                line += f"  {d:>+12.0f}"
+            else:
+                line += f"  {int(d):>12d}"
+        if has_data:
+            any_noise = True
+        print(line)
+    if not any_noise:
+        print(f"    (no background splits or compaction detected)")
+
     # Memory trajectory: compare first run from each group
     print(f"\n  --- Memory Trajectory (run #1 from each group) ---")
     first_runs = [(label, runs[0]) for label, runs in groups]

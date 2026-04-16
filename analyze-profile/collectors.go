@@ -115,6 +115,15 @@ var tikvMetricNames = []string{
 	"tikv_engine_num_running_compactions",
 	"tikv_engine_compaction_duration_seconds_count",
 	"tikv_engine_compaction_duration_seconds_sum",
+	// Region splits — can cause latency spikes during ANALYZE if stats
+	// writes push a region over the split threshold.
+	"tikv_raftstore_region_count",
+	"tikv_raftstore_apply_log_duration_seconds_count",
+	"tikv_raftstore_apply_log_duration_seconds_sum",
+	"tikv_raftstore_store_size_bytes",
+	"tikv_pd_heartbeat_tick_total",
+	"tikv_raftstore_region_split_duration_seconds_count",
+	"tikv_raftstore_region_split_duration_seconds_sum",
 }
 
 // AnalyzeJobsPoller polls mysql.analyze_jobs for the target table.
