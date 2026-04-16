@@ -511,10 +511,11 @@ func dumpTableStats(db *sql.DB, cfg *Config, runDir string) {
 		vlog("dump %s: %dms", d.filename, time.Since(t0).Milliseconds())
 	}
 
-	// HTTP stats dump. For partitioned tables with thousands of partitions,
-	// this endpoint returns a very large JSON (hundreds of MB). 60s is not
-	// enough; allow up to 10 minutes.
-	statsURL := fmt.Sprintf("%s/stats/dump/%s/%s", cfg.StatusURL(), cfg.DB, cfg.Table)
+	// HTTP stats dump. Skip per-partition stats — only the global stats are
+	// needed for accuracy comparison, and the per-partition data is enormous
+	// (16 GB for 8000 partitions × 17 columns: 29M buckets, 3M TopN, 136K
+	// FMSketches). The global-only dump is <1 MB.
+	statsURL := fmt.Sprintf("%s/stats/dump/%s/%s?dumpPartitionStats=false", cfg.StatusURL(), cfg.DB, cfg.Table)
 	statsPath := fmt.Sprintf("%s/stats_dump.json", runDir)
 	t0 := time.Now()
 	if err := downloadFile(statsURL, statsPath, 10*time.Minute); err != nil {
