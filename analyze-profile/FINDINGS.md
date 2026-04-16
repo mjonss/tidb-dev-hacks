@@ -88,13 +88,24 @@ non-index histogram bucket with Repeat > 0 to match the TopN counter's
 encoded-byte key format. With ~2M buckets, each allocating ~130 bytes,
 this produces 267 MB of `reallocBytes`.
 
-**Fix** (committed as 7a7a50c7f4): reuse a single `encodeBuf` via
-`codec.EncodeKey(tz, encodeBuf[:0], ...)`. The buffer grows once to
-~130 bytes and stays there. The map copies the key on insert.
+**Fix attempt** (committed as 7a7a50c7f4, then reverted in 2d460033af):
+tried reusing a single `encodeBuf` via `encodeBuf[:0]`. But
+`hack.String(encoded)` creates an unsafe string sharing the buffer's
+memory, and Go maps with unsafe string keys don't necessarily copy the
+underlying bytes — reusing the buffer corrupted existing map entries.
 
-Longer-term: avoid encoding entirely by decoding the ~few-thousand
-TopN keys to Datums and binary-searching for each histogram bound
-using Datum comparison (same approach BASE's `EqualRowCount` uses).
+**Correct fix**: avoid encoding entirely. Decode the ~few-thousand
+TopN counter keys to Datums once (via `topNMetaToDatum`), sort them,
+and binary-search for each histogram upper bound using Datum comparison.
+This is O(buckets × log(TopN_unique)) with zero allocation. Same
+approach BASE's `EqualRowCount` uses internally.
+
+Alternatively: for column histograms, the encoding in Phase 2 exists
+only because the TopN counter uses codec-encoded byte keys. Column
+histogram bounds are native Datums (int64 for INT, collation sort key
+bytes for VARCHAR). TopN `.Encoded` is `codec.EncodeKey(datum)`. The
+round-trip decode→Datum is lossless for all types. So the Datum binary
+search is both correct and avoids all encoding.
 
 ### Root cause #2: double bucket4Merging for Repeat values (434 MB)
 
@@ -126,18 +137,21 @@ serves to identify global TopN candidates. Once Phase 3 determines the
 counts from the histogram data. The other ~550K leftTopN entries' counts
 are already represented in the Phase 2 bucket4Merging entries.
 
-**Fix** (to be implemented):
-1. Phase 2: keep full bucket counts (don't subtract Repeat). Still
-   accumulate counter entries for TopN candidate identification.
+**Fix** (committed as 2d460033af, all `TestMerge*` pass):
+1. Phase 2: keep full bucket counts (don't subtract Repeat). Store
+   original `Repeat` in bucket4Merging for Phase 4. Track Repeat-origin
+   counts in a separate `repeatFromHist` map.
 2. Phase 3: determine global TopN (100 entries) — unchanged.
-3. Phase 4: only subtract the 100 global TopN values' counts from
-   affected bucket4Merging entries (binary search, trivial). Do NOT
-   convert leftTopN to bucket4Merging — their counts are already in
-   the Phase 2 buckets.
-4. Adjust `totCount` only for the 100 global TopN entries.
+3. Phase 4: for each global TopN value, subtract per-bucket Repeat from
+   matching bucket4Merging entries (using stored `b.Repeat`). Adjust
+   `totCount` using `repeatFromHist` to correctly separate TopN-origin
+   vs Repeat-origin portions.
+4. Phase 6 (leftover TopN): only convert entries with `topNOrigin > 0`
+   (from partition TopN, not histogram Repeat) to bucket4Merging. Pure
+   Repeat-origin leftovers are already in the histogram.
 
 Eliminates ~434 MB of Phase 4 bucket4Merging, ~550K `topNMetaToDatum` +
-`buildBucket4Merging` calls, and simplifies the data flow.
+`buildBucket4Merging` calls, and the 59 MB Datum.Clone overhead.
 
 ### Root cause #3: Datum.Clone (+59 MB)
 
@@ -161,31 +175,77 @@ Histogram.buildBucket4Merging: 427 MB (single representation, no Phase 4)
 NewHistogram: 53 MB
 ```
 
-### Expected impact of fixes #1 + #2
+### Expected impact of fix #2 (committed)
 
-| | Current PR | After fixes | BASE |
+| | Original PR | After fix #2 | BASE |
 |---|---|---|---|
-| codec allocs | 267 MB | ~0 MB | — |
+| codec allocs | 267 MB | 267 MB (unchanged) | — |
 | Phase 2 buckets | 393 MB | ~400 MB (full count) | 427 MB |
-| Phase 4 buckets | 434 MB | ~0 MB | ~21 MB |
-| Other | ~906 MB | ~906 MB | ~320 MB |
-| **Total in-use** | **2000 MB** | **~1300 MB** | **768 MB** |
-| **GC peak** | **11.6 GB** | **~7-8 GB** (est.) | **4.5 GB** |
+| Phase 4 buckets | 434 MB | **~0 MB** | ~21 MB |
+| Datum.Clone | 59 MB | **~0 MB** | — |
+| Other | ~847 MB | ~847 MB | ~320 MB |
+| **Total in-use** | **2000 MB** | **~1500 MB** | **768 MB** |
+| **GC peak** | **11.6 GB** | **~8-9 GB** (est.) | **4.5 GB** |
 
-Remaining gap (~530 MB vs BASE) is from the `sorted` TopNMeta slice
-(line 1655, ~491 MB of string copies from counter map iteration) and
-sync.Pool overhead. Addressable by reusing counter keys instead of
-copying them.
+### Remaining gap: ~730 MB vs BASE
 
-## TODO for Next Run
+1. **codec.EncodeKey** (267 MB): fix #1 reverted. Needs Datum binary-
+   search approach to fix safely.
+2. **`sorted` TopNMeta slice** (~491 MB, line 1655): iterating the
+   counter map and copying each key via `hack.Slice(string(value))`
+   allocates a new byte slice per entry. Addressable by reusing keys
+   or building the TopNMeta slice incrementally.
+3. **sync.Pool churn** (~87 MB): bucket4Merging pool pressure from
+   the ~2M allocations + releases.
+
+### Future optimization: pointer-based merge (prototyped, not landed)
+
+Replaces bucket4Merging structs (~800 MB) with a sorted array of
+`bucketRef{histIdx uint16, bucketIdx uint16}` pointers (~8 MB). Sort
+comparisons read bounds directly from the original Histogram chunks —
+zero Datum copies, zero struct allocation.
+
+Prototype passed `TestMerge*` tests but failed `TestGlobalStatsData*`
+because the simplified equi-depth Phase 5 doesn't handle the bucket
+overlap splitting that `mergeByUpperBound` does (fraction calculation
+for partition buckets with overlapping value ranges). Needs the overlap
+logic integrated into the pointer-based walk.
+
+Expected savings if completed:
+
+| | Fix #2 only | + pointer refactor | BASE |
+|---|---|---|---|
+| bucket4Merging | ~400 MB | **~8 MB** | 427 MB |
+| Datum copies | ~320 MB | **~0 MB** | ~320 MB |
+| codec.EncodeKey | 267 MB | **~0 MB** | — |
+| sorted TopNMeta | ~491 MB | ~491 MB | — |
+| **Total merge overhead** | **~1500 MB** | **~500 MB** | **768 MB** |
+
+This would make the PR **better than BASE** on memory — 500 MB vs
+768 MB — while also being O(P×T) instead of BASE's O(P²×T) for TopN.
+
+## PR commits applied
+
+| Commit | Description | Status |
+|---|---|---|
+| `7a7a50c7f4` | Reuse encode buffer in Phase 2 | **Reverted** in next commit (unsafe with hack.String) |
+| `2d460033af` | Eliminate double bucket4Merging for Repeat values | **Landed**, all `TestMerge*` pass |
+
+Pre-existing test failures on the PR branch (not caused by our changes):
+TestGlobalStatsData2, TestGlobalStatsData3, TestGlobalIndexStatistics,
+TestGlobalStatsMergeCombined — these fail both before and after our commits.
+
+## TODO
 
 - [x] Investigate why PR async=ON retains ~2x more live objects
 - [x] Add ?dumpPartitionStats=false to stats dump URL
-- [ ] Re-run with fix #1 (buffer reuse, committed) and fix #2 (deferred
-      Repeat subtraction, to be implemented) to verify memory reduction
-- [ ] Re-run full matrix with all tooling fixes applied
+- [x] Fix #2: eliminate double bucket4Merging (committed)
+- [ ] Re-run benchmark with fix #2 to verify memory reduction
+- [ ] Fix #1: replace codec.EncodeKey with Datum binary-search approach
+- [ ] Pointer-based merge refactoring (needs overlap handling in equi-depth)
+- [ ] Address sorted TopNMeta slice allocation (~491 MB)
+- [ ] Re-run full matrix with all fixes
 - [ ] Verify "existing" runs complete without OOM at 16 GB
-- [ ] Check collector_debug.log for overhead of 2s heap captures
 - [ ] Review TiDB logs for warnings/errors
 
 ## Accuracy
