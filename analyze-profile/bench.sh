@@ -453,22 +453,10 @@ run_matrix_for_label() {
     for async in "${ASYNC_MERGE_VALUES[@]}"; do
       for i in $(seq 1 "${ITERATIONS}"); do
         playground_reload "${bin}"
-        local have_stats=0
         local state
         for state in "${STATES[@]}"; do
-          if [[ "${state}" == "existing" && "${have_stats}" -eq 0 ]]; then
-            # No preceding clean run in STATES — prime with an untimed
-            # ANALYZE so the "existing" measurement has something to update.
-            log "Priming stats for 'existing' run"
-            mysql -h 127.0.0.1 -P 4000 -u root -e \
-              "ANALYZE TABLE \`${DB_NAME}\`.\`${PART_TABLE}\`" >/dev/null 2>&1 || true
-            mysql -h 127.0.0.1 -P 4000 -u root -e \
-              "ANALYZE TABLE \`${DB_NAME}\`.\`${NONPART_TABLE}\`" >/dev/null 2>&1 || true
-            have_stats=1
-          fi
           warmup
           run_one_profile "${label}" "${scenario}" "${state}" "${async}" "${i}"
-          have_stats=1
         done
       done
     done
