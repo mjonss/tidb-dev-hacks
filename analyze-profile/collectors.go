@@ -111,6 +111,10 @@ var tikvMetricNames = []string{
 	// when the ANALYZE is writing back stats.
 	"tikv_scheduler_command_duration_seconds_count",
 	"tikv_scheduler_command_duration_seconds_sum",
+	// RocksDB compaction — detect background compaction during benchmark runs.
+	"tikv_engine_num_running_compactions",
+	"tikv_engine_compaction_duration_seconds_count",
+	"tikv_engine_compaction_duration_seconds_sum",
 }
 
 // AnalyzeJobsPoller polls mysql.analyze_jobs for the target table.

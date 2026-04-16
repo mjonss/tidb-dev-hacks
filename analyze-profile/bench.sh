@@ -292,6 +292,86 @@ br_backup_combined() {
     || die "BR backup failed (see ${OUTPUT_ROOT}/br-backup.log)"
 }
 
+# Force TiKV MVCC GC and RocksDB compaction to completion so the combined
+# backup starts from a clean, settled state. Without this, restores may
+# trigger background GC/compaction during benchmark runs, adding noise.
+flush_gc_and_compact() {
+  log "Flushing MVCC GC + RocksDB compaction before backup"
+
+  # 1. Shorten GC lifetime and run interval so old versions become eligible
+  #    immediately and the GC worker picks them up quickly.
+  local orig_lifetime orig_interval
+  orig_lifetime=$(mysql -N -h 127.0.0.1 -P 4000 -u root -e \
+    "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'tikv_gc_life_time'" 2>/dev/null || echo "10m0s")
+  orig_interval=$(mysql -N -h 127.0.0.1 -P 4000 -u root -e \
+    "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'tikv_gc_run_interval'" 2>/dev/null || echo "10m0s")
+  mysql -h 127.0.0.1 -P 4000 -u root -e "
+    SET GLOBAL tidb_gc_life_time = '10s';
+    SET GLOBAL tidb_gc_run_interval = '10s';
+  " 2>/dev/null || true
+  log "  GC lifetime=${orig_lifetime} → 10s, interval=${orig_interval} → 10s"
+
+  # 2. Wait for GC safe point to advance, indicating GC has completed.
+  #    Poll every 5s for up to 2 minutes.
+  log "  Waiting for GC safe point to advance..."
+  local gc_done=0 i
+  local initial_sp
+  initial_sp=$(mysql -N -h 127.0.0.1 -P 4000 -u root -e \
+    "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'tikv_gc_safe_point'" 2>/dev/null || echo "")
+  for i in $(seq 1 24); do
+    sleep 5
+    local current_sp
+    current_sp=$(mysql -N -h 127.0.0.1 -P 4000 -u root -e \
+      "SELECT VARIABLE_VALUE FROM mysql.tidb WHERE VARIABLE_NAME = 'tikv_gc_safe_point'" 2>/dev/null || echo "")
+    if [[ -n "${current_sp}" && -n "${initial_sp}" && "${current_sp}" != "${initial_sp}" ]]; then
+      log "  GC safe point advanced: ${initial_sp} → ${current_sp}"
+      gc_done=1
+      break
+    fi
+  done
+  if [[ "${gc_done}" -eq 0 ]]; then
+    log "  GC safe point did not advance in 2m (may be no old versions to collect)"
+  fi
+
+  # 3. Restore original GC settings.
+  mysql -h 127.0.0.1 -P 4000 -u root -e "
+    SET GLOBAL tidb_gc_life_time = '${orig_lifetime}';
+    SET GLOBAL tidb_gc_run_interval = '${orig_interval}';
+  " 2>/dev/null || true
+
+  # 4. Trigger RocksDB compaction on TiKV via tikv-ctl.
+  log "  Triggering RocksDB compaction..."
+  "${TIUP}" ctl:nightly tikv --host "127.0.0.1:20160" \
+    compact-cluster -b -d kv \
+    >>"${OUTPUT_ROOT}/tikv-compact.log" 2>&1 || true
+  "${TIUP}" ctl:nightly tikv --host "127.0.0.1:20160" \
+    compact-cluster -b -d raft \
+    >>"${OUTPUT_ROOT}/tikv-compact.log" 2>&1 || true
+
+  # 5. Wait for compaction to settle by polling TiKV metrics for
+  #    running compaction count. If we can't read metrics, just sleep.
+  local tikv_metrics_url="http://127.0.0.1:${TIKV_STATUS_PORT:-20180}/metrics"
+  local settled=0
+  for i in $(seq 1 30); do
+    sleep 2
+    local running
+    running=$(curl -s "${tikv_metrics_url}" 2>/dev/null \
+      | grep '^tikv_engine_num_running_compactions ' \
+      | awk '{print int($2)}' || echo "")
+    if [[ -n "${running}" && "${running}" -eq 0 ]]; then
+      settled=1
+      break
+    fi
+  done
+  if [[ "${settled}" -eq 1 ]]; then
+    log "  Compaction settled"
+  else
+    log "  Compaction may still be running (timed out after 60s)"
+  fi
+
+  log "  GC + compaction flush complete"
+}
+
 generate_data() {
   log "Generating table via analyze-profile setup (rows=${GEN_ROWS} cols=${GEN_COLUMNS} parts=${GEN_PARTITIONS})"
   "${SCRIPT_DIR}/analyze-profile" setup \
