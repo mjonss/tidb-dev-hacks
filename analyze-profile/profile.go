@@ -289,6 +289,28 @@ func truncateStats(db *sql.DB, runDir string) error {
 const dropStatsBatchSize = 8
 
 func dropStats(db *sql.DB, cfg *Config) error {
+	// Skip if no stats exist — avoids the slow DROP STATS path on a fresh
+	// cluster where BR restore didn't carry any statistics.
+	hasStats := false
+	var dummy int
+	err := db.QueryRow(`SELECT 1 FROM mysql.stats_meta sm
+		JOIN information_schema.tables t ON sm.table_id = t.TIDB_TABLE_ID
+		WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ? AND sm.count > 0
+		LIMIT 1`, cfg.DB, cfg.Table).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		err = db.QueryRow(`SELECT 1 FROM mysql.stats_meta sm
+			JOIN information_schema.partitions p ON sm.table_id = p.TIDB_PARTITION_ID
+			WHERE p.TABLE_SCHEMA = ? AND p.TABLE_NAME = ? AND sm.count > 0
+			LIMIT 1`, cfg.DB, cfg.Table).Scan(&dummy)
+	}
+	if err == nil {
+		hasStats = true
+	}
+	if !hasStats {
+		fmt.Fprintf(os.Stderr, "No statistics for %s.%s — skipping DROP STATS\n", cfg.DB, cfg.Table)
+		return nil
+	}
+
 	fmt.Fprintf(os.Stderr, "Dropping statistics for %s.%s...", cfg.DB, cfg.Table)
 	dropStart := time.Now()
 
