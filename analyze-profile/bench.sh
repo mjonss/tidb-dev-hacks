@@ -353,6 +353,77 @@ SQL
 # Profile runs
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-process resource monitor
+# ---------------------------------------------------------------------------
+# Samples CPU%, RSS, VSZ for tidb-server, tikv-server, pd-server, and the
+# analyze-profile Go binary every 2 seconds. Writes a TSV that can be
+# correlated with the metrics timeline. Uses ps (cross-platform).
+
+PROCESS_MONITOR_PID=""
+
+start_process_monitor() {
+  local out_dir="$1"
+  local tsv="${out_dir}/process_monitor.tsv"
+  printf 'timestamp\tpid\tprocess\tcpu_pct\trss_kb\tvsz_kb\n' > "${tsv}"
+  (
+    while true; do
+      local now
+      now=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%H:%M:%S.%f')[:12])" 2>/dev/null || date +%H:%M:%S)
+      # ps output: pid, %cpu, rss (KB), vsz (KB), command
+      ps -eo pid,pcpu,rss,vsz,comm 2>/dev/null | while read -r pid cpu rss vsz comm; do
+        case "${comm}" in
+          *tidb-server*|*tikv-server*|*pd-server*|*analyze-profile*)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${now}" "${pid}" "${comm##*/}" "${cpu}" "${rss}" "${vsz}" >> "${tsv}"
+            ;;
+        esac
+      done
+      sleep 2
+    done
+  ) &
+  PROCESS_MONITOR_PID=$!
+}
+
+stop_process_monitor() {
+  if [[ -n "${PROCESS_MONITOR_PID}" ]]; then
+    kill "${PROCESS_MONITOR_PID}" 2>/dev/null || true
+    wait "${PROCESS_MONITOR_PID}" 2>/dev/null || true
+    PROCESS_MONITOR_PID=""
+  fi
+}
+
+# Capture a system-wide snapshot: disk space, load average, memory pressure.
+capture_system_snapshot() {
+  local out="$1"
+  {
+    echo "=== $(date) ==="
+    echo
+    echo "--- load average ---"
+    uptime
+    echo
+    echo "--- disk space ---"
+    df -h . 2>/dev/null || df -h
+    echo
+    echo "--- memory ---"
+    if [[ "$(uname)" == "Darwin" ]]; then
+      vm_stat 2>/dev/null || true
+      echo
+      sysctl hw.memsize 2>/dev/null || true
+    else
+      cat /proc/meminfo 2>/dev/null | head -20 || free -h 2>/dev/null || true
+    fi
+    echo
+    echo "--- disk I/O (Linux only) ---"
+    if [[ -f /proc/diskstats ]]; then
+      head -20 /proc/diskstats
+    fi
+  } > "${out}" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Profile runs
+# ---------------------------------------------------------------------------
+
 build_analyzer() {
   log "Building analyze-profile"
   (cd "${SCRIPT_DIR}" && go build -o analyze-profile .)
@@ -395,6 +466,13 @@ run_one_profile() {
   fi
 
   log "RUN ${label} ${scenario} ${state} async=${async} iter=${iter} → ${out_dir}"
+
+  # Start per-process resource monitor alongside the profiler.
+  start_process_monitor "${out_dir}"
+
+  # Snapshot system state before the run.
+  capture_system_snapshot "${out_dir}/system_before.txt"
+
   "${SCRIPT_DIR}/analyze-profile" profile \
     --db "${DB_NAME}" --table "${table}" \
     ${part_flag} \
@@ -406,6 +484,10 @@ run_one_profile() {
     "${analyze_columns_flag[@]}" \
     "${set_args[@]}" \
     2> "${out_dir}/run.log" || log "WARN: analyze-profile returned non-zero (see ${out_dir}/run.log)"
+
+  # Stop the process monitor + snapshot system state after.
+  stop_process_monitor
+  capture_system_snapshot "${out_dir}/system_after.txt"
 
   # analyze-profile creates a run_<ts> subdir under output-dir; capture it.
   local inner
