@@ -440,16 +440,11 @@ run_one_profile() {
   fi
 }
 
-# Run the matrix for one label (PR or BASE). For each cell we restart+reload
-# the cluster before any "clean" run; "existing" runs immediately follow on
-# the same cluster so prior stats exist. Matrix dimensions come from the
-# SCENARIOS, STATES, ASYNC_MERGE_VALUES, ITERATIONS config.
-#
-# Inner loop per (scenario, async, iter):
-#   1. reload (fresh playground + restore + clone + warmup)
-#   2. run clean
-#   3. warmup (drops caches via fresh BR? no — just touch pages again)
-#   4. run existing
+# Run the matrix for one label (PR or BASE). Each (scenario, async, iter)
+# gets a fresh cluster reload. "clean" runs drop stats; "existing" runs
+# follow on the same cluster so the prior ANALYZE's stats are still
+# cached in memory — this is the realistic production scenario and
+# deliberately stresses the memory path the PR targets.
 run_matrix_for_label() {
   local label="$1"
   local bin="$2"
@@ -457,30 +452,18 @@ run_matrix_for_label() {
   for scenario in "${SCENARIOS[@]}"; do
     for async in "${ASYNC_MERGE_VALUES[@]}"; do
       for i in $(seq 1 "${ITERATIONS}"); do
-        # Decide whether this iteration needs a fresh cluster. If "clean" is
-        # requested, it always does. If only "existing" is requested, still
-        # reload so we start from a known state (ANALYZE once, discard, then
-        # the second ANALYZE runs against those stats).
-        local needs_reload=0
+        playground_reload "${bin}"
+        local have_stats=0
         local state
         for state in "${STATES[@]}"; do
-          if [[ "${state}" == "clean" ]]; then needs_reload=1; fi
-        done
-        if [[ "${needs_reload}" -eq 1 || " ${STATES[*]} " != *" clean "* ]]; then
-          playground_reload "${bin}"
-        fi
-        # Walk states in this order: clean first (so existing sees stats from
-        # it), then existing.
-        local have_stats=0
-        for state in "${STATES[@]}"; do
           if [[ "${state}" == "existing" && "${have_stats}" -eq 0 ]]; then
-            # No preceding clean run in STATES — build stats with an untimed
+            # No preceding clean run in STATES — prime with an untimed
             # ANALYZE so the "existing" measurement has something to update.
             log "Priming stats for 'existing' run"
             mysql -h 127.0.0.1 -P 4000 -u root -e \
-              "ANALYZE TABLE \`${DB_NAME}\`.\`${PART_TABLE}\`" >/dev/null
+              "ANALYZE TABLE \`${DB_NAME}\`.\`${PART_TABLE}\`" >/dev/null 2>&1 || true
             mysql -h 127.0.0.1 -P 4000 -u root -e \
-              "ANALYZE TABLE \`${DB_NAME}\`.\`${NONPART_TABLE}\`" >/dev/null
+              "ANALYZE TABLE \`${DB_NAME}\`.\`${NONPART_TABLE}\`" >/dev/null 2>&1 || true
             have_stats=1
           fi
           warmup
