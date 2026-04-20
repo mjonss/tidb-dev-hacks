@@ -74,7 +74,7 @@ partition). With 8000 partitions × 17 columns:
 
 ---
 
-## stats_* Table Design
+## stats_* Table Design and Save Performance
 
 The `mysql.stats_histograms`, `stats_buckets`, `stats_top_n`, and
 `stats_fm_sketch` tables lack clustered primary keys. For 8000
@@ -85,10 +85,51 @@ partitions × 17 columns:
 - The write amplification from non-clustered PKs compounds with the
   number of partitions.
 
-### TODO (separate PR)
-- [ ] Evaluate adding clustered PKs to the stats tables (migration
-      concern — these are system tables).
-- [ ] Batch stats writes per partition to reduce transaction count.
+### stats_buckets → stats_data migration (in progress)
+
+PR `stats-tables-with-clustered-pk` replaces `stats_buckets` with
+`stats_data` (clustered PK). Full ANALYZE dropped from 23m to 9.7m
+on 8K partitions. See pingcap/tidb#66751.
+
+### FMSketch: dominant save cost
+
+CPU profiling shows FMSketch INSERT is **68% of the save phase** —
+9.16s out of 13.4s per 10s profile window. Each column's FMSketch
+(~8 KB protobuf blob) is a separate `INSERT INTO mysql.stats_fm_sketch`
+statement. With 8K partitions × 17 columns = 136K individual INSERTs.
+
+Moving FMSketch into `stats_data` (same clustered-PK table as buckets)
+and batching the inserts would eliminate most of this overhead.
+
+### SQL round-trips within save transaction
+
+Each partition save is one transaction but **~119 individual SQL
+statements**: 17× (DELETE topn + INSERT topn + DELETE fm_sketch +
+INSERT fm_sketch + REPLACE histograms + INSERT/UPDATE stats_data +
+INSERT column_stats_usage). Each statement goes through TiDB's
+parse → plan → execute → TiKV write cycle.
+
+With all data in `stats_data`, this could be reduced to ~4-5 SQL
+statements per partition: one batch DELETE + one batch INSERT for
+stats_data + a few for stats_histograms and column_stats_usage.
+
+### Batching multiple partitions per transaction
+
+Currently: one transaction per partition (8K commits for 8K partitions).
+Each 2PC commit has ~1-2ms fixed overhead.
+
+Batching 10-20 partitions per transaction would reduce commits from
+8K to ~400-800 while keeping transaction size small (~3-6 MB per
+batch for 17 columns). Transaction size is safe up to ~50 partitions
+even for wide tables (100 columns × 18 KB/col = 1.7 MB/partition).
+
+### TODO
+- [x] Migrate stats_buckets → stats_data with clustered PK (#66751)
+- [ ] Migrate stats_fm_sketch → stats_data (next PR)
+- [ ] Batch all column data (buckets + fm_sketch + topn) into one
+      multi-row INSERT per partition instead of per-column INSERTs
+- [ ] Evaluate batching multiple partitions per transaction commit
+- [ ] Migrate stats_top_n → stats_data
 
 ---
 
