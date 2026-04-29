@@ -68,16 +68,27 @@ ITERATIONS="${ITERATIONS:-2}"
 
 # Test both on and off for the PR's relevant variable.
 # Override to just ("ON") for a faster matrix; use "run escalate" to only add
-# OFF if ON shows a regression.
-ASYNC_MERGE_VALUES=("ON" "OFF")
+# OFF if ON shows a regression. Env override: ASYNC_MERGE="ON" (space-separated).
+if [[ -n "${ASYNC_MERGE:-}" ]]; then
+  read -ra ASYNC_MERGE_VALUES <<< "${ASYNC_MERGE}"
+else
+  ASYNC_MERGE_VALUES=("ON" "OFF")
+fi
 
-# Scenarios to run, in order. Override to shrink the matrix, e.g.
-# SCENARIOS=("part-full" "nonpart-full") to skip single-partition.
+# Scenarios to run, in order. Env override: SCENARIOS_FILTER="part-full part-single".
 # Valid values: part-full, part-single, nonpart-full.
-SCENARIOS=("part-full" "part-single" "nonpart-full")
+if [[ -n "${SCENARIOS_FILTER:-}" ]]; then
+  read -ra SCENARIOS <<< "${SCENARIOS_FILTER}"
+else
+  SCENARIOS=("part-full" "part-single" "nonpart-full")
+fi
 
-# Stats-state values. Override to e.g. ("clean") to skip warm-stats runs.
-STATES=("clean" "existing")
+# Stats-state values. Env override: STATES_FILTER="clean".
+if [[ -n "${STATES_FILTER:-}" ]]; then
+  read -ra STATES <<< "${STATES_FILTER}"
+else
+  STATES=("clean" "existing")
+fi
 
 # --- Minimal test config ----------------------------------------------------
 # Set MINIMAL=1 (or run `./bench.sh run smoke`) to use a tiny matrix that

@@ -77,12 +77,20 @@ def from_stats_dump(run_dir: str) -> dict | None:
             })
         return out
 
-    columns = extract(dump.get("columns") or {})
-    indexes = extract(dump.get("indices") or {})
+    # On partitioned tables the global stats live under partitions.global,
+    # and the top-level columns/indices fields are null. Fall through to the
+    # global partition's columns/indices when that's the case.
+    src = dump
+    if (dump.get("columns") in (None, {})) and isinstance(dump.get("partitions"), dict):
+        g = dump["partitions"].get("global")
+        if isinstance(g, dict):
+            src = g
+    columns = extract(src.get("columns") or {})
+    indexes = extract(src.get("indices") or {})
     return {
         # Row count still comes from the profile_result.json accuracy field.
-        "row_count": {"stats_count": dump.get("count", 0),
-                      "actual_count": dump.get("count", 0),
+        "row_count": {"stats_count": src.get("count", 0),
+                      "actual_count": src.get("count", 0),
                       "ratio": 1.0},
         "column_stats": columns,
         "index_stats": indexes,

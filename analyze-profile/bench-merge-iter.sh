@@ -37,6 +37,7 @@ PARTITIONS="${GEN_PARTITIONS:-8000}"
 ROWS="${GEN_ROWS:-30000000}"
 COLUMNS="${GEN_COLUMNS:-17}"
 SEED="${GEN_SEED:-42}"
+ASYNC_MERGE="${ASYNC_MERGE:-ON}"     # override per invocation: ASYNC_MERGE=OFF ./bench-merge-iter.sh run ...
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -147,13 +148,17 @@ cmd_setup() {
     "DROP TABLE IF EXISTS analyze_profile.t_nonpart" 2>/dev/null || true
 
   # Full ANALYZE — populates all partition + global stats
+  # innodb_lock_wait_timeout bumped to 1h so partition saves don't fail under
+  # the TiKV-nightly lock contention that currently shows up on this cluster.
   log "Running full ANALYZE TABLE ALL COLUMNS (this takes ~25 min for 8K partitions)"
   mysql -h 127.0.0.1 -P 4000 -u root <<SQL
+SET GLOBAL innodb_lock_wait_timeout = 3600;
 SET GLOBAL tidb_analyze_version = 2;
 SET GLOBAL tidb_partition_prune_mode = 'dynamic';
 SET GLOBAL tidb_analyze_partition_concurrency = ${TIDB_ANALYZE_PARTITION_CONCURRENCY:-6};
 SET GLOBAL tidb_build_stats_concurrency = 2;
 SET GLOBAL tidb_build_sampling_stats_concurrency = 2;
+SET SESSION innodb_lock_wait_timeout = 3600;
 ANALYZE TABLE analyze_profile.t_partitioned ALL COLUMNS;
 SQL
   log "Full ANALYZE complete"
@@ -194,9 +199,12 @@ cmd_run() {
     --log-file "${out_dir}/br-restore.log" \
     || die "BR restore failed"
 
-  # Disable auto-analyze to prevent TiDB from re-analyzing after restore
+  # Disable auto-analyze to prevent TiDB from re-analyzing after restore.
+  # Bump innodb_lock_wait_timeout so the global-stats save path doesn't fail
+  # under TiKV-nightly lock contention (symptom seen 2026-04-22).
   mysql -h 127.0.0.1 -P 4000 -u root -e \
-    "SET GLOBAL tidb_enable_auto_analyze = OFF" 2>/dev/null || true
+    "SET GLOBAL tidb_enable_auto_analyze = OFF;
+     SET GLOBAL innodb_lock_wait_timeout = 3600;" 2>/dev/null || true
 
   # Verify stats were restored
   local stats_count
@@ -228,7 +236,8 @@ cmd_run() {
     --set-variable "tidb_analyze_partition_concurrency=6" \
     --set-variable "tidb_build_stats_concurrency=2" \
     --set-variable "tidb_build_sampling_stats_concurrency=2" \
-    --set-variable "tidb_enable_async_merge_global_stats=ON" \
+    --set-variable "tidb_enable_async_merge_global_stats=${ASYNC_MERGE}" \
+    --set-variable "innodb_lock_wait_timeout=3600" \
     2>"${out_dir}/run.log" || log "WARN: analyze-profile returned non-zero"
 
   # Save TiDB + TiKV logs before stopping (playground cleanup deletes them).
