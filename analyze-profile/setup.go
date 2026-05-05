@@ -416,9 +416,9 @@ func bulkInsert(db *sql.DB, cfg *Config, plan []ColumnPlan, profile PartitionPro
 // indexKeyBytes returns the index key size in bytes for a column type (utf8mb4).
 func indexKeyBytes(typeName string) int {
 	switch {
-	case typeName == "INT":
+	case typeName == "INT", typeName == "INT UNSIGNED":
 		return 4
-	case typeName == "BIGINT":
+	case typeName == "BIGINT", typeName == "BIGINT UNSIGNED":
 		return 8
 	case strings.HasPrefix(typeName, "CHAR"):
 		// CHAR(N) → N * 4 bytes (utf8mb4)

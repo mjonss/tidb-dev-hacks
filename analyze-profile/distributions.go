@@ -117,6 +117,16 @@ func typeMappers(maxStringLen int) []TypeMapper {
 			// 2^53 for safe integer range
 			return fmt.Sprintf("%d", int64(v*float64(int64(1)<<53)))
 		}},
+		{"INT UNSIGNED", func(v float64, _ *rand.Rand) string {
+			// 0..MaxUint32 — exceeds MaxInt32, so a signed mis-treatment
+			// of these values would put them on the negative side of zero.
+			return fmt.Sprintf("%d", uint32(v*float64(math.MaxUint32)))
+		}},
+		{"BIGINT UNSIGNED", func(v float64, _ *rand.Rand) string {
+			// [2^53, 2^54) — both float64-representable and entirely above
+			// MaxInt32, so signed mis-treatment surfaces immediately.
+			return fmt.Sprintf("%d", uint64(1)<<53+uint64(v*float64(int64(1)<<53)))
+		}},
 		{"CHAR(32)", func(v float64, _ *rand.Rand) string {
 			// Seed a local RNG from v so same v always produces same string
 			localRng := rand.New(rand.NewSource(int64(v * float64(int64(1)<<53))))
