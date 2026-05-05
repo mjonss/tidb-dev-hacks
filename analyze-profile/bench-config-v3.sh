@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
 # Wrapper that runs bench.sh with the v3 benchmark config (improve-global-stats-3
-# PR vs upstream): a freshly generated 8000-partition / 30M-row / 20-column
-# table covering all merge-relevant (type × distribution × nullability)
-# combinations, plus one single-column and one multi-column secondary index.
+# PR vs upstream).
+#
+# Shape of the v3 run:
+#   - 8000-partition, 30M-row, 20-column mixed-type t_partitioned table.
+#   - No t_nonpart twin (SKIP_NONPART_CLONE=1).
+#   - Combined backup is seeded with PR-produced per-partition stats: the
+#     prepare phase runs a full ANALYZE TABLE … ALL COLUMNS with the PR
+#     binary, profiled and captured as the "no previous stats" baseline,
+#     then BR-backs up data + stats together.
+#   - Auto-analyze is forced OFF after every playground start.
+#   - Test matrix is restricted to PARTITION-SINGLE × EXISTING-stats only,
+#     async=ON. No DROP STATS ever happens. Each test cell starts from the
+#     seeded backup and runs ANALYZE TABLE … PARTITION p5, which (in
+#     dynamic prune mode) reads the 7999 existing partition stats and does
+#     a full N=8000 global merge — which is exactly what we want to
+#     compare between PR and BASE.
 #
 # Usage:
 #   ./bench-config-v3.sh build
-#   ./bench-config-v3.sh prepare        # build the combined-backup-v3 once
+#   ./bench-config-v3.sh prepare        # one-time: generate + seed-ANALYZE + BR backup
 #   ./bench-config-v3.sh run quick      # 1 cell each branch
-#   ./bench-config-v3.sh run all        # full matrix
+#   ./bench-config-v3.sh run all        # full part-single matrix
 #   ./bench-config-v3.sh compare > output-bench-v3/report.txt
 #
-# All bench.sh subcommands are forwarded with these env-var overrides applied.
+# All bench.sh subcommands are forwarded.
 #
 # ============================================================================
-# Order of operations (what bench.sh actually does for an `all` run)
+# Order of operations for `./bench-config-v3.sh all` (or run all)
 # ============================================================================
 #
 # 1. cmd_build           — compiles ./analyze-profile (Go), checks BIN_PR/BASE.
@@ -25,57 +38,61 @@
 #
 #      a) playground_reload BIN
 #           - On the very first call: prepare_combined_backup BIN
-#               i)   playground_stop   (no-op if nothing running)
-#               ii)  playground_start BIN  (fresh tiup playground)
-#               iii) generate_data           ← creates t_partitioned via
-#                                              `analyze-profile setup` with
-#                                              --column-spec + --index
-#               iv)  clone_nonpartitioned    ← INSERT…SELECT into t_nonpart
-#               v)   br_backup_combined      ← BR backup → combined-backup-v3/
-#               vi)  playground_stop
-#           - Subsequent calls: skip prepare; just stop, start fresh, restore
-#             from combined-backup-v3 (so every iter starts byte-identical).
-#           - Restore order:
-#               i)   playground_stop
-#               ii)  playground_start BIN
-#               iii) br_restore combined-backup-v3
+#               i)   playground_stop                (no-op if nothing running)
+#               ii)  playground_start ${BIN_PR}     ← seed binary, NOT BIN
+#                       └─ disable_auto_analyze     (always)
+#               iii) generate_data                  ← analyze-profile setup
+#                                                     --column-spec (20 cols)
+#                                                     --index c14
+#                                                     --index c2,c19
+#               iv)  (clone_nonpartitioned skipped — SKIP_NONPART_CLONE=1)
+#               v)   seed_analyze                   ← profiled ANALYZE TABLE
+#                                                     t_partitioned ALL COLUMNS
+#                                                     using BIN_PR; output in
+#                                                     output-bench-v3/PR/
+#                                                     seed-full-analyze/run_<ts>/
+#                                                     (NOT in manifest.tsv —
+#                                                      this is the baseline
+#                                                      reference)
+#               vi)  br_backup_combined             ← combined-backup-v3/
+#                                                     (now contains data + stats)
+#               vii) playground_stop
+#           - Subsequent calls: stop / start BIN / disable_auto_analyze /
+#             br_restore from combined-backup-v3 (every iter starts from
+#             byte-identical seeded state).
 #
-#      b) For each state in (clean, existing):
-#           i)   warmup            — SELECT COUNT(*) on both tables, primes
-#                                    block cache so first ANALYZE isn't I/O-
-#                                    bound.
-#           ii)  run_one_profile   — see step 4.
+#      b) for each state in (existing):
+#           i)   warmup            — SELECT COUNT(*) on t_partitioned only
+#                                    (t_nonpart doesn't exist).
+#           ii)  run_one_profile   — see step 4. NEVER passes --drop-stats
+#                                    because state ≠ clean.
 #
-#         Both states run on the SAME cluster instance — `existing` deliberately
-#         keeps prior `clean` stats in TiDB's memory cache, which is the
-#         realistic re-analyze scenario the merge optimization targets.
+# 4. run_one_profile LABEL part-single existing ON ITER:
 #
-# 4. run_one_profile LABEL SCENARIO STATE ASYNC ITER:
-#
-#      a) start_process_monitor          — background ps sampler, 2s cadence
-#      b) capture_system_snapshot before — disk/load/mem
-#      c) ./analyze-profile profile … (the heavy lifter):
-#         - SET session/global vars (--set-variable)
-#         - DROP STATS if --drop-stats (clean state)
-#         - ANALYZE TABLE … with the requested scope
+#      a) start_process_monitor          — background ps sampler @ 2s
+#      b) capture_system_snapshot before
+#      c) ./analyze-profile profile … :
+#         - SET vars (--set-variable, including tidb_enable_async_merge_global_stats=ON)
+#         - --partition p5
+#         - ANALYZE TABLE … PARTITION p5 ALL COLUMNS
+#           ↳ in dynamic prune mode, this re-collects p5's per-partition
+#             stats AND merges all 8000 partitions' stats into fresh global
+#             stats — which is the full N=8000 merge under test.
 #         - During ANALYZE, in parallel:
-#             * heap snapshots every 2s
-#             * CPU profile (CPU_PROFILE_SECONDS, default 10s)
-#             * goroutine + mutex snapshots before/after
-#             * mysql.analyze_jobs polling for per-partition timing
-#             * tidb_metrics scrape every 1s
-#         - Post-ANALYZE: dump stats_dump.json, run accuracy check
+#             heap snapshots @ 2s,
+#             CPU profile (CPU_PROFILE_SECONDS, default 10s),
+#             goroutine + mutex snapshots before/after,
+#             mysql.analyze_jobs polling,
+#             tidb metrics scrape @ 1s.
+#         - Post-ANALYZE: dump stats_dump.json, accuracy check.
 #      d) stop_process_monitor
 #      e) capture_system_snapshot after
-#      f) Append run_<ts> dir to manifest.tsv
-#      g) Copy tidb-logs/ and tikv-logs/ into the run dir (rotated logs glob)
-#         — must happen before the next playground_reload destroys the
-#         tiup data dir.
+#      f) Append run_<ts> to manifest.tsv (only the matrix runs, NOT the seed)
+#      g) Copy tidb-logs/ + tikv-logs/ into run dir
 #
-# 5. cmd_compare         — for each (scenario, state, async) cell, runs
-#                          compare-runs.py (durations/RSS/heap), profile-diff.py
-#                          (CPU/heap top-diff), accuracy-diff.py against the
-#                          manifest groups; writes report.txt.
+# 5. cmd_compare         — for each (scenario, state, async) cell:
+#                          compare-runs.py / profile-diff.py / accuracy-diff.py
+#                          → writes output-bench-v3/report.txt.
 #
 # ============================================================================
 
@@ -115,6 +132,23 @@ DATETIME:low-ndv,DATETIME:zipf,TIMESTAMP:uniform,DATETIME:per-part-categ:NULL(40
 # Multi-column on (c2, c19) (INT UNSIGNED, TIMESTAMP) — heterogeneous concat
 # encoding plus exercises the unsigned codec inside an index key.
 export INDEXES="c14 c2,c19"
+
+# --- Backup shape ------------------------------------------------------------
+# No non-partitioned twin: only t_partitioned is in the combined backup.
+export SKIP_NONPART_CLONE=1
+
+# Seed the combined backup with PR-produced per-partition stats. Two effects:
+#   1. Subsequent test cells start from a cluster that already has stats,
+#      so part-single ANALYZE re-merges 7999 pre-existing + 1 fresh
+#      partition (the realistic re-analyze pattern).
+#   2. The seed-analyze run itself is profiled and captured as the
+#      "no previous stats" baseline for PR — output-bench-v3/PR/seed-full-analyze/.
+export SEED_ANALYZE_BINARY="${SCRIPT_DIR}/tidb-server.pr"
+
+# --- Test matrix restriction -------------------------------------------------
+# Only single-partition ANALYZEs, only with existing stats. Never DROP STATS.
+export SCENARIOS_FILTER="part-single"
+export STATES_FILTER="existing"
 
 # --- Isolated artifacts so v3 doesn't clobber v2 -----------------------------
 export COMBINED_BACKUP_DIR="${SCRIPT_DIR}/combined-backup-v3"

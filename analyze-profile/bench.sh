@@ -116,11 +116,21 @@ playground_start() {
   for i in $(seq 1 90); do
     if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then
       log "playground ready"
+      disable_auto_analyze
       return
     fi
     sleep 2
   done
   die "playground did not come up in 180s (see ${PLAYGROUND_LOG})"
+}
+
+# Auto-analyze must always be off so background ANALYZEs don't race with
+# the benchmarked run and pollute timings or stats. SET GLOBAL applies to
+# all subsequent sessions; nothing is connected yet at this point.
+disable_auto_analyze() {
+  mysql -h 127.0.0.1 -P 4000 -u root \
+    -e "SET GLOBAL tidb_enable_auto_analyze = OFF" >/dev/null 2>&1 \
+    || log "WARN: failed to disable tidb_enable_auto_analyze"
 }
 
 # Return the tiup-playground binary PID (the actual component that spawns
@@ -251,12 +261,20 @@ playground_reload() {
 }
 
 warmup() {
-  log "Warming caches (SELECT COUNT(*) on both tables)"
-  mysql -h 127.0.0.1 -P 4000 -u root <<SQL >/dev/null
+  if [[ "${SKIP_NONPART_CLONE:-0}" == "1" ]]; then
+    log "Warming caches (SELECT COUNT(*) on ${PART_TABLE})"
+    mysql -h 127.0.0.1 -P 4000 -u root <<SQL >/dev/null
+SET SESSION tidb_mem_quota_query = 0;
+SELECT COUNT(*) FROM \`${DB_NAME}\`.\`${PART_TABLE}\`;
+SQL
+  else
+    log "Warming caches (SELECT COUNT(*) on both tables)"
+    mysql -h 127.0.0.1 -P 4000 -u root <<SQL >/dev/null
 SET SESSION tidb_mem_quota_query = 0;
 SELECT COUNT(*) FROM \`${DB_NAME}\`.\`${PART_TABLE}\`;
 SELECT COUNT(*) FROM \`${DB_NAME}\`.\`${NONPART_TABLE}\`;
 SQL
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -399,10 +417,18 @@ generate_data() {
     || die "analyze-profile setup failed (see ${OUTPUT_ROOT}/generate.log)"
 }
 
-# Build the combined backup once: either restore the source backup or generate
-# data via analyze-profile setup, then clone the non-partitioned twin, then
-# back both tables up together. All subsequent reloads restore from the
-# combined backup instead of rebuilding every time.
+# Build the combined backup once. Default flow: restore the source backup
+# or generate data via analyze-profile setup, clone the non-partitioned
+# twin, then BR-back up both tables together.
+#
+# Optional knobs (env vars from bench-config.sh):
+#   SEED_ANALYZE_BINARY — when set, that binary is used for the entire
+#     prepare phase, and a profiled "ANALYZE TABLE <PART_TABLE> ALL COLUMNS"
+#     runs before backup so the resulting combined backup contains stats.
+#   SKIP_NONPART_CLONE=1 — skip the t_nonpart clone step.
+#
+# All subsequent reloads restore from the combined backup instead of
+# rebuilding every time.
 prepare_combined_backup() {
   local bin="$1"
   if [[ -f "${COMBINED_BACKUP_DIR}/backupmeta" ]]; then
@@ -410,6 +436,16 @@ prepare_combined_backup() {
     return
   fi
   log "Preparing combined backup (one-time)"
+
+  # When a seed binary is configured, use it throughout prepare so the
+  # backup's stats are produced by that binary.
+  if [[ -n "${SEED_ANALYZE_BINARY}" ]]; then
+    [[ -x "${SEED_ANALYZE_BINARY}" ]] || \
+      die "SEED_ANALYZE_BINARY not executable: ${SEED_ANALYZE_BINARY}"
+    log "SEED_ANALYZE_BINARY=${SEED_ANALYZE_BINARY} — overriding prepare-phase binary"
+    bin="${SEED_ANALYZE_BINARY}"
+  fi
+
   playground_stop
   playground_start "${bin}"
   if [[ "${GENERATE_DATA}" == "1" ]]; then
@@ -417,9 +453,78 @@ prepare_combined_backup() {
   else
     br_restore "${BR_BACKUP_DIR}"
   fi
-  clone_nonpartitioned
+  if [[ "${SKIP_NONPART_CLONE}" != "1" ]]; then
+    clone_nonpartitioned
+  else
+    log "SKIP_NONPART_CLONE=1 — skipping non-partitioned twin"
+  fi
+  if [[ -n "${SEED_ANALYZE_BINARY}" ]]; then
+    seed_analyze
+  fi
   br_backup_combined
   playground_stop
+}
+
+# Run a full profiled ANALYZE TABLE <PART_TABLE> ALL COLUMNS using the
+# currently-running playground (which the caller arranged to be the seed
+# binary). Output lands under ${OUTPUT_ROOT}/${LABEL_PR}/seed-full-analyze/
+# and is intentionally NOT added to manifest.tsv — it's the "no previous
+# stats" baseline reference, separate from the test matrix.
+seed_analyze() {
+  warmup
+  local out_dir="${OUTPUT_ROOT}/${LABEL_PR}/seed-full-analyze"
+  mkdir -p "${out_dir}"
+  log "Seed ANALYZE (full table, all columns) → ${out_dir}"
+
+  start_process_monitor "${out_dir}"
+  capture_system_snapshot "${out_dir}/system_before.txt"
+
+  local set_args=()
+  for sv in "${COMMON_SET_VARS[@]}"; do
+    set_args+=(--set-variable "${sv}")
+  done
+  set_args+=(--set-variable "tidb_enable_async_merge_global_stats=ON")
+
+  local analyze_columns_flag=()
+  if [[ -n "${ANALYZE_COLUMNS}" ]]; then
+    analyze_columns_flag=(--analyze-columns "${ANALYZE_COLUMNS}")
+  fi
+
+  "${SCRIPT_DIR}/analyze-profile" profile \
+    --db "${DB_NAME}" --table "${PART_TABLE}" \
+    --check-accuracy \
+    --verbose \
+    --cpu-profile-seconds "${CPU_PROFILE_SECONDS}" \
+    --output-dir "${out_dir}" \
+    "${analyze_columns_flag[@]}" \
+    "${set_args[@]}" \
+    2> "${out_dir}/run.log" || log "WARN: seed analyze returned non-zero (see ${out_dir}/run.log)"
+
+  stop_process_monitor
+  capture_system_snapshot "${out_dir}/system_after.txt"
+
+  # Copy tidb + tikv logs into the run dir (same as run_one_profile).
+  local inner
+  inner=$(find "${out_dir}" -mindepth 1 -maxdepth 1 -type d -name 'run_*' | head -1)
+  if [[ -n "${inner}" ]]; then
+    local tidb_log tikv_log
+    tidb_log=$(find_tidb_log_path)
+    if [[ -n "${tidb_log}" && -f "${tidb_log}" ]]; then
+      local log_dir log_stem
+      log_dir=$(dirname "${tidb_log}")
+      log_stem=$(basename "${tidb_log}" .log)
+      mkdir -p "${inner}/tidb-logs"
+      cp "${log_dir}/${log_stem}"*.log* "${inner}/tidb-logs/" 2>/dev/null || true
+    fi
+    tikv_log=$(find_tikv_log_path)
+    if [[ -n "${tikv_log}" && -f "${tikv_log}" ]]; then
+      local log_dir log_stem
+      log_dir=$(dirname "${tikv_log}")
+      log_stem=$(basename "${tikv_log}" .log)
+      mkdir -p "${inner}/tikv-logs"
+      cp "${log_dir}/${log_stem}"*.log* "${inner}/tikv-logs/" 2>/dev/null || true
+    fi
+  fi
 }
 
 clone_nonpartitioned() {

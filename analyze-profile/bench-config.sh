@@ -136,6 +136,22 @@ COLUMN_SPEC="${COLUMN_SPEC:-}"
 # INDEXES="c14 c2,c19" creates KEY (c14) and KEY (c2, c19).
 INDEXES="${INDEXES:-}"
 
+# When non-empty, prepare_combined_backup uses this binary throughout the
+# prepare phase AND runs a profiled "ANALYZE TABLE <PART_TABLE> ALL COLUMNS"
+# with it before BR-backing up. Two effects:
+#   1. The combined backup contains per-partition stats produced by this
+#      binary, so later cells start from a realistic "stats already exist"
+#      cluster rather than blank.
+#   2. The full ANALYZE itself is captured (full profiling) under
+#      ${OUTPUT_ROOT}/${LABEL_PR}/seed-full-analyze/ as the "no previous
+#      stats" baseline run for the seed binary.
+SEED_ANALYZE_BINARY="${SEED_ANALYZE_BINARY:-}"
+
+# When 1, prepare_combined_backup skips creating the t_nonpart twin. The
+# warmup step will then only touch ${PART_TABLE}, and nonpart-* scenarios
+# cannot be run.
+SKIP_NONPART_CLONE="${SKIP_NONPART_CLONE:-0}"
+
 # Session vars applied to every run (before ANALYZE). One per line, "name=value".
 # Defaults match the sample-based-accuracy.md setup.
 COMMON_SET_VARS=(
