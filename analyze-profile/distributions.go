@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -178,6 +179,162 @@ func distributionNames() []string {
 // isSequentialDist returns true for the Sequential distribution (index 4).
 func isSequentialDist(distIdx int) bool {
 	return distIdx == 4
+}
+
+// defaultNullRate is the fraction of inserted values that are NULL for a
+// nullable column when the spec does not pin the rate. Matches the
+// pre-existing 1-in-20 cyclic-default behavior.
+const defaultNullRate = 0.05
+
+// ColumnPlan describes the type, distribution, and nullability for one
+// generated column.
+//
+// Nullable controls the DDL constraint (NULL vs NOT NULL).
+// NullRate is the probability (0.0–1.0) of inserting a NULL value during
+// data generation; it is forced to 0 when Nullable is false.
+type ColumnPlan struct {
+	Type     TypeMapper
+	DistIdx  int // index into distributions() / distributionNames()
+	Nullable bool
+	NullRate float64
+}
+
+// columnPlan returns one ColumnPlan per generated column.
+// If cfg.ColumnSpec is non-empty it is parsed (TYPE:DIST[:NULL[(rate)]|NOTNULL],...).
+// Otherwise the cyclic default applies (cfg.Columns entries cycling
+// types and distributions independently, alternating NULL/NOT NULL every
+// len(types) columns).
+func columnPlan(cfg *Config) ([]ColumnPlan, error) {
+	tms := typeMappers(cfg.MaxStringLength)
+	if cfg.ColumnSpec == "" && cfg.ColumnTypes == "int" {
+		tms = intTypeMappers()
+	}
+	distNames := distributionNames()
+
+	if cfg.ColumnSpec != "" {
+		return parseColumnSpec(cfg.ColumnSpec, tms, distNames)
+	}
+
+	out := make([]ColumnPlan, cfg.Columns)
+	for i := 0; i < cfg.Columns; i++ {
+		tm := tms[i%len(tms)]
+		d := i % len(distNames)
+		if isSequentialDist(d) && isStringType(tm) {
+			d = 0
+		}
+		nullable := (i/len(tms))%2 == 0
+		rate := 0.0
+		if nullable {
+			rate = defaultNullRate
+		}
+		out[i] = ColumnPlan{Type: tm, DistIdx: d, Nullable: nullable, NullRate: rate}
+	}
+	return out, nil
+}
+
+// parseColumnSpec parses a "TYPE:DIST[:NULL[(rate)]|NOTNULL],..." spec string.
+// Type names are case-insensitive; bare "CHAR" matches "CHAR(32)",
+// "VARCHAR" matches "VARCHAR(255)", "DECIMAL" matches "DECIMAL(10,2)".
+// Distribution names match distributionNames() exactly.
+// Sequential distribution + string type silently falls back to uniform.
+//
+// Nullability token (case-insensitive, optional, default "NULL"):
+//
+//	NOTNULL       NOT NULL column, no NULL values inserted
+//	NULL          nullable, default null rate (5%)
+//	NULL(f)       nullable, f% of values inserted as NULL (0.0–100.0)
+func parseColumnSpec(spec string, tms []TypeMapper, distNames []string) ([]ColumnPlan, error) {
+	entries := strings.Split(spec, ",")
+	out := make([]ColumnPlan, 0, len(entries))
+	for i, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		parts := strings.Split(e, ":")
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("entry %d (%q): expected TYPE:DIST[:NULL[(rate)]|NOTNULL]", i+1, e)
+		}
+		tm, err := lookupColumnType(tms, strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", i+1, err)
+		}
+		distIdx, err := lookupDistribution(distNames, strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", i+1, err)
+		}
+		if isSequentialDist(distIdx) && isStringType(tm) {
+			distIdx = 0
+		}
+		nullable := true
+		rate := defaultNullRate
+		if len(parts) == 3 {
+			nullable, rate, err = parseNullability(strings.TrimSpace(parts[2]))
+			if err != nil {
+				return nil, fmt.Errorf("entry %d: %w", i+1, err)
+			}
+		}
+		out = append(out, ColumnPlan{Type: tm, DistIdx: distIdx, Nullable: nullable, NullRate: rate})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no entries parsed from %q", spec)
+	}
+	return out, nil
+}
+
+// parseNullability parses the nullability token. Accepts (case-insensitive):
+//
+//	NOTNULL                → (false, 0)
+//	NULL                   → (true, defaultNullRate)
+//	NULL(f) where 0<=f<=100 → (true, f/100)
+func parseNullability(tok string) (bool, float64, error) {
+	upper := strings.ToUpper(tok)
+	if upper == "NOTNULL" || upper == "NOT_NULL" {
+		return false, 0, nil
+	}
+	if upper == "NULL" {
+		return true, defaultNullRate, nil
+	}
+	if strings.HasPrefix(upper, "NULL(") && strings.HasSuffix(upper, ")") {
+		inner := upper[len("NULL(") : len(upper)-1]
+		f, err := strconv.ParseFloat(inner, 64)
+		if err != nil {
+			return false, 0, fmt.Errorf("null rate %q: %w", inner, err)
+		}
+		if f < 0 || f > 100 {
+			return false, 0, fmt.Errorf("null rate %g out of range (0.0–100.0)", f)
+		}
+		return true, f / 100.0, nil
+	}
+	return false, 0, fmt.Errorf("nullability token %q: expected NULL, NULL(rate), or NOTNULL", tok)
+}
+
+func lookupColumnType(tms []TypeMapper, name string) (TypeMapper, error) {
+	upper := strings.ToUpper(name)
+	for _, tm := range tms {
+		u := strings.ToUpper(tm.TypeName)
+		if u == upper {
+			return tm, nil
+		}
+		if base, _, ok := strings.Cut(u, "("); ok && base == upper {
+			return tm, nil
+		}
+	}
+	avail := make([]string, len(tms))
+	for i, tm := range tms {
+		avail[i] = tm.TypeName
+	}
+	return TypeMapper{}, fmt.Errorf("unknown type %q (available: %s)", name, strings.Join(avail, ", "))
+}
+
+func lookupDistribution(names []string, name string) (int, error) {
+	lower := strings.ToLower(name)
+	for i, n := range names {
+		if strings.ToLower(n) == lower {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("unknown distribution %q (available: %s)", name, strings.Join(names, ", "))
 }
 
 // PartitionProfile controls the row distribution across partitions.

@@ -30,6 +30,14 @@ func runSetup(cfg *Config) error {
 
 	profile, _ := ParsePartitionProfile(cfg.PartitionProfile)
 
+	// Build the per-column plan once and pass it through. ValidateSetup
+	// already parsed --column-spec; here we materialize the full plan
+	// (including the cyclic default branch).
+	plan, err := columnPlan(cfg)
+	if err != nil {
+		return fmt.Errorf("column plan: %w", err)
+	}
+
 	// Resolve random seed.
 	if cfg.Seed == 0 {
 		cfg.Seed = time.Now().UnixNano()
@@ -70,15 +78,15 @@ func runSetup(cfg *Config) error {
 	fmt.Fprintf(os.Stderr, "Dropped existing table (if any): %s\n", cfg.Table)
 
 	// Build CREATE TABLE
-	createSQL := buildCreateTable(cfg)
+	createSQL := buildCreateTable(cfg, plan)
 	if _, err := db.Exec(createSQL); err != nil {
 		return fmt.Errorf("create table: %w\nSQL: %s", err, createSQL)
 	}
 	fmt.Fprintf(os.Stderr, "Created table: %s (%d columns, %d partitions)\n", cfg.Table, cfg.Columns, cfg.Partitions)
-	printColumnLayout(cfg)
+	printColumnLayout(cfg, plan)
 
 	// Bulk insert
-	if err := bulkInsert(db, cfg, profile); err != nil {
+	if err := bulkInsert(db, cfg, plan, profile); err != nil {
 		return fmt.Errorf("insert: %w", err)
 	}
 
@@ -102,44 +110,36 @@ func runSetup(cfg *Config) error {
 	return nil
 }
 
-func buildCreateTable(cfg *Config) string {
-	tms := typeMappers(cfg.MaxStringLength)
-	if cfg.ColumnTypes == "int" {
-		tms = intTypeMappers()
-	}
-
+func buildCreateTable(cfg *Config, plan []ColumnPlan) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("CREATE TABLE `%s` (\n", cfg.Table))
 	sb.WriteString("  `pk` BIGINT NOT NULL,\n")
 
-	for i := 0; i < cfg.Columns; i++ {
-		tm := tms[i%len(tms)]
+	for i, p := range plan {
 		colName := fmt.Sprintf("c%d", i+1)
-		// Cycle NULL/NOT NULL: first cycle allows NULL, next does NOT, etc.
-		cycle := i / len(tms)
 		nullable := "NULL"
-		if cycle%2 == 1 {
+		if !p.Nullable {
 			nullable = "NOT NULL"
 		}
 		// Default value for NOT NULL columns
 		defaultClause := ""
-		if nullable == "NOT NULL" {
+		if !p.Nullable {
 			switch {
-			case strings.HasPrefix(tm.TypeName, "INT"), strings.HasPrefix(tm.TypeName, "BIGINT"):
+			case strings.HasPrefix(p.Type.TypeName, "INT"), strings.HasPrefix(p.Type.TypeName, "BIGINT"):
 				defaultClause = " DEFAULT 0"
-			case strings.HasPrefix(tm.TypeName, "CHAR"), strings.HasPrefix(tm.TypeName, "VARCHAR"):
+			case strings.HasPrefix(p.Type.TypeName, "CHAR"), strings.HasPrefix(p.Type.TypeName, "VARCHAR"):
 				defaultClause = " DEFAULT ''"
-			case strings.HasPrefix(tm.TypeName, "DECIMAL"), strings.HasPrefix(tm.TypeName, "FLOAT"), strings.HasPrefix(tm.TypeName, "DOUBLE"):
+			case strings.HasPrefix(p.Type.TypeName, "DECIMAL"), strings.HasPrefix(p.Type.TypeName, "FLOAT"), strings.HasPrefix(p.Type.TypeName, "DOUBLE"):
 				defaultClause = " DEFAULT 0"
-			case tm.TypeName == "DATE":
+			case p.Type.TypeName == "DATE":
 				defaultClause = " DEFAULT '2000-01-01'"
-			case tm.TypeName == "DATETIME":
+			case p.Type.TypeName == "DATETIME":
 				defaultClause = " DEFAULT '2000-01-01 00:00:00'"
-			case tm.TypeName == "TIMESTAMP":
+			case p.Type.TypeName == "TIMESTAMP":
 				defaultClause = " DEFAULT CURRENT_TIMESTAMP"
 			}
 		}
-		sb.WriteString(fmt.Sprintf("  `%s` %s %s%s", colName, tm.TypeName, nullable, defaultClause))
+		sb.WriteString(fmt.Sprintf("  `%s` %s %s%s", colName, p.Type.TypeName, nullable, defaultClause))
 		sb.WriteString(",\n")
 	}
 
@@ -150,10 +150,9 @@ func buildCreateTable(cfg *Config) string {
 	const maxIndexKeyBytes = 3072
 	colKeyBytes := make(map[string]int)
 	colKeyBytes["pk"] = 8 // BIGINT = 8 bytes
-	for i := 0; i < cfg.Columns; i++ {
-		tm := tms[i%len(tms)]
+	for i, p := range plan {
 		name := fmt.Sprintf("c%d", i+1)
-		colKeyBytes[name] = indexKeyBytes(tm.TypeName)
+		colKeyBytes[name] = indexKeyBytes(p.Type.TypeName)
 	}
 
 	// Secondary indexes
@@ -196,7 +195,9 @@ func buildCreateTable(cfg *Config) string {
 					typeName := ""
 					if ic.name != "pk" {
 						colIdx, _ := strconv.Atoi(ic.name[1:])
-						typeName = tms[(colIdx-1)%len(tms)].TypeName
+						if colIdx >= 1 && colIdx <= len(plan) {
+							typeName = plan[colIdx-1].Type.TypeName
+						}
 					}
 					if !strings.HasPrefix(typeName, "VARCHAR") && !strings.HasPrefix(typeName, "CHAR") {
 						continue
@@ -266,11 +267,7 @@ func buildCreateTable(cfg *Config) string {
 	return sb.String()
 }
 
-func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
-	tms := typeMappers(cfg.MaxStringLength)
-	if cfg.ColumnTypes == "int" {
-		tms = intTypeMappers()
-	}
+func bulkInsert(db *sql.DB, cfg *Config, plan []ColumnPlan, profile PartitionProfile) error {
 	dists := distributions()
 
 	// Compute per-partition row counts from weights
@@ -293,25 +290,12 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 	}
 
 	// Build column name list (including pk)
-	colNames := make([]string, 0, cfg.Columns+1)
+	colNames := make([]string, 0, len(plan)+1)
 	colNames = append(colNames, "`pk`")
-	for i := 0; i < cfg.Columns; i++ {
+	for i := range plan {
 		colNames = append(colNames, fmt.Sprintf("`c%d`", i+1))
 	}
 	colList := strings.Join(colNames, ", ")
-
-	// Determine distribution index for each column, with fallback for
-	// string types + sequential distribution
-	colDistIdx := make([]int, cfg.Columns)
-	for i := 0; i < cfg.Columns; i++ {
-		distIdx := i % len(dists)
-		tm := tms[i%len(tms)]
-		// Sequential distribution is meaningless for string types; fall back to Uniform
-		if isSequentialDist(distIdx) && isStringType(tm) {
-			distIdx = 0
-		}
-		colDistIdx[i] = distIdx
-	}
 
 	// Ensure the connection pool can support the desired concurrency.
 	db.SetMaxOpenConns(cfg.InsertConcurrency + 2)
@@ -386,18 +370,15 @@ func bulkInsert(db *sql.DB, cfg *Config, profile PartitionProfile) error {
 					pk := pkForPartition(seqIdx, partID, cfg.Partitions)
 					sb.WriteString(fmt.Sprintf("%d", pk))
 
-					for col := 0; col < cfg.Columns; col++ {
+					for _, p := range plan {
 						sb.WriteString(", ")
-						tm := tms[col%len(tms)]
-						distIdx := colDistIdx[col]
 
-						// For nullable columns, occasionally insert NULL
-						cycle := col / len(tms)
-						if cycle%2 == 0 && rng.Intn(20) == 0 {
+						// For nullable columns, occasionally insert NULL at the configured rate.
+						if p.NullRate > 0 && rng.Float64() < p.NullRate {
 							sb.WriteString("NULL")
 						} else {
-							v := dists[distIdx](rng, seqIdx, rowsForPart, partID, cfg.Partitions)
-							sb.WriteString(tm.MapFunc(v, rng))
+							v := dists[p.DistIdx](rng, seqIdx, rowsForPart, partID, cfg.Partitions)
+							sb.WriteString(p.Type.MapFunc(v, rng))
 						}
 					}
 					sb.WriteString(")")
@@ -492,30 +473,25 @@ func parseColPrefix(s string) (string, int) {
 }
 
 // printColumnLayout prints the column name → type + distribution mapping.
-func printColumnLayout(cfg *Config) {
-	tms := typeMappers(cfg.MaxStringLength)
-	if cfg.ColumnTypes == "int" {
-		tms = intTypeMappers()
-	}
+func printColumnLayout(_ *Config, plan []ColumnPlan) {
 	dists := distributionNames()
 
 	fmt.Fprintf(os.Stderr, "\nColumn layout:\n")
-	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", "Column", "Type", "Null", "Distribution")
-	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", "------", "----", "----", "------------")
-	for i := 0; i < cfg.Columns; i++ {
-		tm := tms[i%len(tms)]
+	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-12s %s\n", "Column", "Type", "Null", "Distribution")
+	fmt.Fprintf(os.Stderr, "  %-8s %-16s %-12s %s\n", "------", "----", "----", "------------")
+	for i, p := range plan {
 		colName := fmt.Sprintf("c%d", i+1)
-		cycle := i / len(tms)
-		nullable := "YES"
-		if cycle%2 == 1 {
+		var nullable string
+		switch {
+		case !p.Nullable:
 			nullable = "NO"
+		case p.NullRate == defaultNullRate:
+			nullable = "YES"
+		default:
+			nullable = fmt.Sprintf("YES(%.1f%%)", p.NullRate*100)
 		}
-		distIdx := i % len(dists)
-		distName := dists[distIdx]
-		if isSequentialDist(distIdx) && isStringType(tm) {
-			distName = "uniform*" // fallback
-		}
-		fmt.Fprintf(os.Stderr, "  %-8s %-16s %-8s %s\n", colName, tm.TypeName, nullable, distName)
+		distName := dists[p.DistIdx]
+		fmt.Fprintf(os.Stderr, "  %-8s %-16s %-12s %s\n", colName, p.Type.TypeName, nullable, distName)
 	}
 	fmt.Fprintln(os.Stderr)
 }

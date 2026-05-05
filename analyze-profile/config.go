@@ -33,6 +33,7 @@ type Config struct {
 	InsertConcurrency int
 	Seed              int64
 	ColumnTypes       string
+	ColumnSpec        string
 	Indexes           stringSlice
 	MaxStringLength   int
 
@@ -112,9 +113,6 @@ func (c *Config) ValidateSetup() error {
 	if c.Rows < 1 {
 		return fmt.Errorf("--rows must be >= 1")
 	}
-	if c.Columns < 1 || c.Columns > 500 {
-		return fmt.Errorf("--columns must be 1-500")
-	}
 	if c.BatchSize < 1 {
 		return fmt.Errorf("--batch-size must be >= 1")
 	}
@@ -126,6 +124,21 @@ func (c *Config) ValidateSetup() error {
 	}
 	if c.MaxStringLength < 1 {
 		return fmt.Errorf("--max-string-length must be >= 1")
+	}
+	// --column-spec, when set, supersedes --columns and --column-types.
+	// Parse it now so errors surface before we connect to TiDB, and use the
+	// resulting length as the authoritative column count.
+	if c.ColumnSpec != "" {
+		plan, err := parseColumnSpec(c.ColumnSpec, typeMappers(c.MaxStringLength), distributionNames())
+		if err != nil {
+			return fmt.Errorf("--column-spec: %w", err)
+		}
+		if len(plan) > 500 {
+			return fmt.Errorf("--column-spec produces %d columns (max 500)", len(plan))
+		}
+		c.Columns = len(plan)
+	} else if c.Columns < 1 || c.Columns > 500 {
+		return fmt.Errorf("--columns must be 1-500")
 	}
 	for _, idxSpec := range c.Indexes {
 		cols := strings.Split(idxSpec, ",")
@@ -194,7 +207,8 @@ func RegisterSetupFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.BatchSize, "batch-size", 5000, "INSERT batch size")
 	fs.IntVar(&cfg.InsertConcurrency, "insert-concurrency", 8, "Number of parallel partition inserters")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = random, printed for reproducibility)")
-	fs.StringVar(&cfg.ColumnTypes, "column-types", "mixed", "Column types: mixed (all types) or int (INT/BIGINT only)")
+	fs.StringVar(&cfg.ColumnTypes, "column-types", "mixed", "Column types: mixed (all types) or int (INT/BIGINT only). Ignored when --column-spec is set.")
+	fs.StringVar(&cfg.ColumnSpec, "column-spec", "", "Explicit per-column spec: \"TYPE:DIST[:NULL[(rate%)]|NOTNULL],...\". Overrides --columns and --column-types. Example: \"BIGINT:zipf,VARCHAR:low-ndv:NOTNULL,DECIMAL:uniform:NULL(10)\"")
 	fs.Var(&cfg.Indexes, "index", "Secondary index columns (e.g. \"c1,c4\"); repeatable for multiple indexes")
 	fs.IntVar(&cfg.MaxStringLength, "max-string-length", 60, "Maximum length for generated VARCHAR values (adjusts column type if > 255)")
 	fs.StringVar(&cfg.PartitionProfile, "partition-profile", "uniform", "Data distribution across partitions: uniform, range-like, size-skew")
