@@ -127,6 +127,15 @@ GEN_COLUMNS="${GEN_COLUMNS:-10}"
 GEN_PARTITIONS="${GEN_PARTITIONS:-20}"
 GEN_SEED="${GEN_SEED:-42}"
 
+# Optional explicit per-column spec (TYPE:DIST[:NULL[(rate)]|NOTNULL],...).
+# When set, --columns and --column-types in analyze-profile setup are
+# ignored — the spec drives type, distribution, and nullability per column.
+COLUMN_SPEC="${COLUMN_SPEC:-}"
+
+# Optional space-separated list of secondary index column-lists, e.g.
+# INDEXES="c14 c2,c19" creates KEY (c14) and KEY (c2, c19).
+INDEXES="${INDEXES:-}"
+
 # Session vars applied to every run (before ANALYZE). One per line, "name=value".
 # Defaults match the sample-based-accuracy.md setup.
 COMMON_SET_VARS=(

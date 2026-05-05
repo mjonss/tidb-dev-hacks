@@ -373,14 +373,28 @@ flush_gc_and_compact() {
 }
 
 generate_data() {
-  log "Generating table via analyze-profile setup (rows=${GEN_ROWS} cols=${GEN_COLUMNS} parts=${GEN_PARTITIONS})"
-  "${SCRIPT_DIR}/analyze-profile" setup \
-    --db "${DB_NAME}" \
-    --table "${PART_TABLE}" \
-    --rows "${GEN_ROWS}" \
-    --columns "${GEN_COLUMNS}" \
-    --partitions "${GEN_PARTITIONS}" \
-    --seed "${GEN_SEED}" \
+  local args=(
+    --db "${DB_NAME}"
+    --table "${PART_TABLE}"
+    --rows "${GEN_ROWS}"
+    --columns "${GEN_COLUMNS}"
+    --partitions "${GEN_PARTITIONS}"
+    --seed "${GEN_SEED}"
+  )
+  if [[ -n "${COLUMN_SPEC}" ]]; then
+    args+=(--column-spec "${COLUMN_SPEC}")
+    log "Generating table via analyze-profile setup (rows=${GEN_ROWS} parts=${GEN_PARTITIONS} spec set)"
+  else
+    log "Generating table via analyze-profile setup (rows=${GEN_ROWS} cols=${GEN_COLUMNS} parts=${GEN_PARTITIONS})"
+  fi
+  if [[ -n "${INDEXES}" ]]; then
+    # INDEXES is whitespace-separated; each entry is a comma-list passed as
+    # one --index argument (e.g. "c14 c2,c19" → --index c14 --index c2,c19).
+    for idx in ${INDEXES}; do
+      args+=(--index "${idx}")
+    done
+  fi
+  "${SCRIPT_DIR}/analyze-profile" setup "${args[@]}" \
     2> "${OUTPUT_ROOT}/generate.log" \
     || die "analyze-profile setup failed (see ${OUTPUT_ROOT}/generate.log)"
 }
