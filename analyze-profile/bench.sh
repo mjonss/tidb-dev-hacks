@@ -302,9 +302,15 @@ br_backup_combined() {
     Remove it (or use 'bench.sh prepare' after removing) before re-backing up."
   fi
   log "Backing up ${DB_NAME}.{${PART_TABLE},${NONPART_TABLE}} → ${COMBINED_BACKUP_DIR}"
+  # --ignore-stats=false: include mysql.stats_buckets and mysql.stats_top_n
+  # alongside the user data. Default is true, which silently strips the
+  # bucket/TopN payload — leaving only stats_meta + stats_histograms metadata
+  # — and makes any "existing-stats" benchmark scenario meaningless because
+  # the cross-partition merge has no histogram/TopN data to actually merge.
   "${TIUP}" br:nightly backup db \
     --pd 127.0.0.1:2379 \
     --db "${DB_NAME}" \
+    --ignore-stats=false \
     --storage "local://${COMBINED_BACKUP_DIR}" \
     --log-file "${OUTPUT_ROOT}/br-backup.log" \
     || die "BR backup failed (see ${OUTPUT_ROOT}/br-backup.log)"
