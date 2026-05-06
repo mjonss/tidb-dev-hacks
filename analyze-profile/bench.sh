@@ -133,13 +133,15 @@ playground_start() {
 # SET GLOBAL applies to all subsequent sessions; nothing is connected yet
 # at this point.
 disable_auto_analyze() {
-  mysql -h 127.0.0.1 -P 4000 -u root <<SQL >/dev/null 2>&1
+  # `set -e` would exit on a bare failing heredoc-fed command before any
+  # post-check could log a warning. The `|| log …` form makes the failure
+  # part of a control expression so set -e doesn't trigger.
+  local err_file="${OUTPUT_ROOT}/disable_auto_analyze.err"
+  mysql -h 127.0.0.1 -P 4000 -u root >/dev/null 2>"${err_file}" <<SQL \
+    || { log "WARN: disable_auto_analyze failed (see ${err_file})"; tail -3 "${err_file}" 2>/dev/null | sed 's/^/    /' >&2 || true; }
 SET GLOBAL tidb_enable_auto_analyze = OFF;
 SET GLOBAL tidb_lock_wait_timeout = 600;
 SQL
-  if [[ $? -ne 0 ]]; then
-    log "WARN: failed to disable_auto_analyze / raise lock_wait_timeout"
-  fi
 }
 
 # Drain the background stats-delta updater before a heavy ANALYZE. The
