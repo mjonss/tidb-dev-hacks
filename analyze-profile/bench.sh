@@ -337,15 +337,19 @@ br_backup_combined() {
     die "COMBINED_BACKUP_DIR is non-empty: ${COMBINED_BACKUP_DIR}
     Remove it (or use 'bench.sh prepare' after removing) before re-backing up."
   fi
-  log "Backing up ${DB_NAME}.{${PART_TABLE},${NONPART_TABLE}} → ${COMBINED_BACKUP_DIR}"
-  # --ignore-stats=false: include mysql.stats_buckets and mysql.stats_top_n
-  # alongside the user data. Default is true, which silently strips the
-  # bucket/TopN payload — leaving only stats_meta + stats_histograms metadata
-  # — and makes any "existing-stats" benchmark scenario meaningless because
-  # the cross-partition merge has no histogram/TopN data to actually merge.
-  "${TIUP}" br:nightly backup db \
+  log "Backing up cluster (full + stats) → ${COMBINED_BACKUP_DIR}"
+  # `backup full` (not `backup db`) is required to capture mysql.stats_* as
+  # ordinary tables. `backup db --db X --ignore-stats=false` only writes the
+  # JSON schema.stats sidecar files and BR's restore-side --load-stats handling
+  # populates only stats_meta/stats_histograms placeholders — buckets and
+  # TopN never make it back into the persistent system tables, so any
+  # "existing-stats" merge benchmark sees empty inputs.
+  #
+  # `backup full --ignore-stats=false` includes the actual mysql.stats_meta /
+  # stats_histograms / stats_buckets / stats_top_n table contents in the
+  # backup, which `restore full` then writes back as user data.
+  "${TIUP}" br:nightly backup full \
     --pd 127.0.0.1:2379 \
-    --db "${DB_NAME}" \
     --ignore-stats=false \
     --storage "local://${COMBINED_BACKUP_DIR}" \
     --log-file "${OUTPUT_ROOT}/br-backup.log" \
