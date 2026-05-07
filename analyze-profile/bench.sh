@@ -975,23 +975,22 @@ cmd_all() {
   log "Report: ${OUTPUT_ROOT}/report.txt"
 }
 
-cmd_seed_full_pair() {
+cmd_full_analyze_from_backup() {
   # One full-table ANALYZE for BASE and one for PR, both starting from the
-  # restored combined-backup-v3 with --drop-stats so each begins from a
-  # no-prior-stats state. Output goes to <branch>/seed-full-pair/. Captured
-  # logs (now that find_*_log_path is pgrep_argv-portable) include the per-
-  # column merge messages from PR's diagnostic-logs commit, useful for the
-  # per-(type,distribution) breakdown.
+  # restored combined-backup-v3 (which already has seeded stats). No
+  # --drop-stats — the merge is what's being measured, and DROP STATS
+  # over 184K histograms / 48K buckets is a lot of overhead we don't want
+  # in the timing. ANALYZE TABLE … ALL COLUMNS overwrites the stats anyway.
+  # Output goes to <branch>/part-full_existing_asyncON_iter0/.
   [[ -f "${COMBINED_BACKUP_DIR}/backupmeta" ]] \
     || die "no combined backup at ${COMBINED_BACKUP_DIR}; run prepare first"
   build_analyzer
   for entry in "${LABEL_BASE}:${BIN_BASE}" "${LABEL_PR}:${BIN_PR}"; do
     local label="${entry%%:*}" bin="${entry##*:}"
-    log "=== seed-full-pair: ${label} (${bin}) ==="
+    log "=== full-analyze-from-backup: ${label} (${bin}) ==="
     playground_reload "${bin}"
     warmup
-    # part-full + clean → full-table ANALYZE with --drop-stats first
-    run_one_profile "${label}" part-full clean ON 0
+    run_one_profile "${label}" part-full existing ON 0
   done
   playground_stop
 }
@@ -1020,7 +1019,7 @@ case "${1:-}" in
   prepare) shift; cmd_prepare "$@" ;;
   all)     shift; cmd_all "$@" ;;
   smoke)   shift; cmd_smoke "$@" ;;
-  seed-full-pair) shift; cmd_seed_full_pair "$@" ;;
+  full-analyze-from-backup) shift; cmd_full_analyze_from_backup "$@" ;;
   ""|help|-h|--help)
     sed -n '1,/^set -euo/p' "$0" | head -n -2 | sed 's/^# \{0,1\}//'
     ;;
