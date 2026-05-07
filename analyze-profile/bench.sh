@@ -144,31 +144,6 @@ SET GLOBAL innodb_lock_wait_timeout = 600;
 SQL
 }
 
-# Drain the background stats-delta updater before a heavy ANALYZE. The
-# updater flushes accumulated INSERT/UPDATE/DELETE deltas to mysql.stats_meta
-# on a periodic schedule. After a 30M-row bulk INSERT, an in-flight drain can
-# hold locks long enough that ANALYZE TABLE's own preflight FLUSH STATS_DELTA
-# times out. Doing it ourselves with retry catches an idle window for the
-# updater so ANALYZE's preflight is a near no-op afterwards.
-flush_stats_delta_with_retry() {
-  local err_file="$1"
-  local attempt
-  for attempt in 1 2 3 4 5 6; do
-    if mysql -h 127.0.0.1 -P 4000 -u root \
-         -e "SET SESSION innodb_lock_wait_timeout = 600; FLUSH STATS_DELTA" \
-         >/dev/null 2>>"${err_file}"; then
-      log "  flush stats delta ok (attempt ${attempt})"
-      return 0
-    fi
-    if [[ ${attempt} -eq 6 ]]; then
-      log "WARN: flush stats delta failed after 6 attempts (see ${err_file})"
-      return 1
-    fi
-    log "  flush stats delta attempt ${attempt} failed, sleeping 60s..."
-    sleep 60
-  done
-}
-
 # Return the tiup-playground binary PID (the actual component that spawns
 # pd/tikv/tidb and owns the data dir), not the tiup shim or any child.
 # Signal delivery must target this PID directly — propagation through the
@@ -520,9 +495,6 @@ seed_analyze() {
   warmup
   local out_dir="${OUTPUT_ROOT}/${LABEL_PR}/seed-full-analyze"
   mkdir -p "${out_dir}"
-  log "Pre-flushing stats delta before seed ANALYZE..."
-  flush_stats_delta_with_retry "${out_dir}/flush.err" \
-    || log "WARN: pre-flush failed; seed analyze may hit lock-wait-timeout in its own preflight"
   log "Seed ANALYZE (full table, all columns) → ${out_dir}"
 
   start_process_monitor "${out_dir}"
