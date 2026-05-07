@@ -101,12 +101,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Generation: 8000 HASH partitions, 30M rows, fresh seed -------------------
+# Each var honors the caller's env so smaller verification runs (e.g.
+# GEN_PARTITIONS=10 GEN_ROWS=1000000 ./bench-config-v3.sh prepare) work.
 export GENERATE_DATA=1
-export GEN_PARTITIONS=8000
-export GEN_ROWS=30000000
-export GEN_SEED=42
+export GEN_PARTITIONS="${GEN_PARTITIONS:-8000}"
+export GEN_ROWS="${GEN_ROWS:-30000000}"
+export GEN_SEED="${GEN_SEED:-42}"
 # GEN_COLUMNS is overridden by COLUMN_SPEC's length; kept as a fallback.
-export GEN_COLUMNS=20
+export GEN_COLUMNS="${GEN_COLUMNS:-20}"
 
 # --- Per-column spec ---------------------------------------------------------
 # 20 columns covering 5 encoding-path equivalence classes × 4 informative
@@ -150,8 +152,9 @@ export SEED_ANALYZE_BINARY="${SCRIPT_DIR}/tidb-server.pr"
 export SCENARIOS_FILTER="part-single"
 export STATES_FILTER="existing"
 
-# --- Isolated artifacts so v3 doesn't clobber v2 -----------------------------
-export COMBINED_BACKUP_DIR="${SCRIPT_DIR}/combined-backup-v3"
-export OUTPUT_ROOT="${SCRIPT_DIR}/output-bench-v3"
+# --- Isolated artifacts so v3 doesn't clobber v2. Env-overridable so smaller
+#     verification runs land in their own dirs.
+export COMBINED_BACKUP_DIR="${COMBINED_BACKUP_DIR:-${SCRIPT_DIR}/combined-backup-v3}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/output-bench-v3}"
 
 exec "${SCRIPT_DIR}/bench.sh" "$@"
