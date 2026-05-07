@@ -140,7 +140,7 @@ disable_auto_analyze() {
   mysql -h 127.0.0.1 -P 4000 -u root >/dev/null 2>"${err_file}" <<SQL \
     || { log "WARN: disable_auto_analyze failed (see ${err_file})"; tail -3 "${err_file}" 2>/dev/null | sed 's/^/    /' >&2 || true; }
 SET GLOBAL tidb_enable_auto_analyze = OFF;
-SET GLOBAL tidb_lock_wait_timeout = 600;
+SET GLOBAL innodb_lock_wait_timeout = 600;
 SQL
 }
 
@@ -155,7 +155,7 @@ flush_stats_delta_with_retry() {
   local attempt
   for attempt in 1 2 3 4 5 6; do
     if mysql -h 127.0.0.1 -P 4000 -u root \
-         -e "SET SESSION tidb_lock_wait_timeout = 600; FLUSH STATS_DELTA" \
+         -e "SET SESSION innodb_lock_wait_timeout = 600; FLUSH STATS_DELTA" \
          >/dev/null 2>>"${err_file}"; then
       log "  flush stats delta ok (attempt ${attempt})"
       return 0
