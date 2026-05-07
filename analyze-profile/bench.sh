@@ -155,11 +155,25 @@ find_playground_pid() {
   pgrep -f '/tiup-playground ' 2>/dev/null | head -1 || true
 }
 
+# pgrep -a (print full command line) is Linux-only — macOS pgrep ignores
+# the flag and returns just the PID, which silently broke find_*_log_path
+# and dropped every TiDB / TiKV log copy in the matrix run. Helper that
+# emits "PID full-command" portably.
+pgrep_argv() {
+  local pat="$1"
+  local pid
+  for pid in $(pgrep -f "${pat}" 2>/dev/null); do
+    local cmd
+    cmd=$(ps -p "${pid}" -o command= 2>/dev/null)
+    [[ -n "${cmd}" ]] && printf '%s %s\n' "${pid}" "${cmd}"
+  done
+}
+
 # Parse the data dir (e.g. .tiup/data/VGxxxxx) out of a pd/tikv child's argv,
 # for diagnostics in the log.
 find_playground_data_dir() {
   local argv
-  argv=$(pgrep -af 'pd-server.*\.tiup/data/' 2>/dev/null | head -1 || true)
+  argv=$(pgrep_argv 'pd-server.*\.tiup/data/' | head -1)
   [[ -z "${argv}" ]] && return 0
   printf '%s\n' "${argv}" | sed -nE 's|.*(\.tiup/data/[^/]+)/.*|\1|p' | head -1 || true
 }
@@ -167,7 +181,7 @@ find_playground_data_dir() {
 # Find the TiDB log file path from the running tidb-server's --log-file arg.
 find_tidb_log_path() {
   local argv
-  argv=$(pgrep -af 'tidb-server.*--log-file=' 2>/dev/null | head -1 || true)
+  argv=$(pgrep_argv 'tidb-server.*--log-file=' | head -1)
   [[ -z "${argv}" ]] && return 0
   printf '%s\n' "${argv}" | sed -nE 's|.*--log-file=([^ ]+).*|\1|p' | head -1 || true
 }
@@ -175,7 +189,7 @@ find_tidb_log_path() {
 # Find the TiKV log file path from the running tikv-server's --log-file arg.
 find_tikv_log_path() {
   local argv
-  argv=$(pgrep -af 'tikv-server.*--log-file=' 2>/dev/null | head -1 || true)
+  argv=$(pgrep_argv 'tikv-server.*--log-file=' | head -1)
   [[ -z "${argv}" ]] && return 0
   printf '%s\n' "${argv}" | sed -nE 's|.*--log-file=([^ ]+).*|\1|p' | head -1 || true
 }
@@ -961,6 +975,27 @@ cmd_all() {
   log "Report: ${OUTPUT_ROOT}/report.txt"
 }
 
+cmd_seed_full_pair() {
+  # One full-table ANALYZE for BASE and one for PR, both starting from the
+  # restored combined-backup-v3 with --drop-stats so each begins from a
+  # no-prior-stats state. Output goes to <branch>/seed-full-pair/. Captured
+  # logs (now that find_*_log_path is pgrep_argv-portable) include the per-
+  # column merge messages from PR's diagnostic-logs commit, useful for the
+  # per-(type,distribution) breakdown.
+  [[ -f "${COMBINED_BACKUP_DIR}/backupmeta" ]] \
+    || die "no combined backup at ${COMBINED_BACKUP_DIR}; run prepare first"
+  build_analyzer
+  for entry in "${LABEL_BASE}:${BIN_BASE}" "${LABEL_PR}:${BIN_PR}"; do
+    local label="${entry%%:*}" bin="${entry##*:}"
+    log "=== seed-full-pair: ${label} (${bin}) ==="
+    playground_reload "${bin}"
+    warmup
+    # part-full + clean → full-table ANALYZE with --drop-stats first
+    run_one_profile "${label}" part-full clean ON 0
+  done
+  playground_stop
+}
+
 cmd_smoke() {
   # End-to-end minimal test. Uses t_partitioned (small backup), 1 iter,
   # async=ON only, 2 scenarios, clean state only — see MINIMAL block in
@@ -985,6 +1020,7 @@ case "${1:-}" in
   prepare) shift; cmd_prepare "$@" ;;
   all)     shift; cmd_all "$@" ;;
   smoke)   shift; cmd_smoke "$@" ;;
+  seed-full-pair) shift; cmd_seed_full_pair "$@" ;;
   ""|help|-h|--help)
     sed -n '1,/^set -euo/p' "$0" | head -n -2 | sed 's/^# \{0,1\}//'
     ;;
