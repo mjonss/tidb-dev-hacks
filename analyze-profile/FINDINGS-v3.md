@@ -147,19 +147,94 @@ Captured during prepare phase as the "no-prior-stats" baseline for PR:
 
 Output: `output-bench-v3/PR/seed-full-analyze/run_20260507_142206/`.
 
-## Open work
+## Full-table ANALYZE pair (BASE + PR on combined-backup-v3)
 
-- **Per-column timing breakdown by (type, distribution):** the bench
-  harness's per-iter TiDB log copy step didn't preserve any `tidb*.log`
-  files (none in any run dir). To split the 24-35 min BASE merge CPU and
-  the 30-40 s PR merge CPU across the 21 columns, we need the TiDB diagnostic
-  logs that PR commit `d4c1a0d90c` added. Plan: fix the harness's log copy,
-  then re-run a single PR async=ON cell and a single BASE async=ON cell
-  to capture per-column timings.
-- **BASE seed-full-analyze for direct PR-vs-BASE comparison on the
-  full-table path:** only PR's seed run was captured during prepare.
-  A matched BASE run is needed to compare on the full-table merge path,
-  not just the partial-merge path.
+Added a `full-analyze-from-backup` subcommand that restores
+`combined-backup-v3` and runs `ANALYZE TABLE … ALL COLUMNS` on each
+binary in turn. Both starting from the same data + seeded stats. No
+`--drop-stats` (DROP STATS over 184K histograms is expensive, ANALYZE
+overwrites stats anyway).
+
+| Branch | Total run | ANALYZE phase wallclock |
+|---|---|---|
+| BASE  | 1h12m02s | **41m33s** |
+| PR    | 39m09s | **8m27s** |
+
+PR's full-table ANALYZE phase is **4.9× faster** — consistent with the
+matrix's part-single 5× speedup, on the maximum-merge-work scenario
+(8000 freshly-collected partitions all in memory simultaneously).
+
+### Per-column merge function timing (PR-only, from diagnostic logs)
+
+PR's `MergePartTopNAndHistToGlobal` logs entry/exit per column at INFO
+level (commit `d4c1a0d90c`). BASE doesn't have these logs.
+
+| Column | Type | Distribution | merge fn (s) |
+|---|---|---|---|
+| pk | BIGINT | uniform | 1.137 |
+| c1 | BIGINT | low-ndv | **0.077** |
+| c2 | INT UNSIGNED | zipf | 0.985 |
+| c3 | BIGINT UNSIGNED | uniform:NOTNULL | 1.248 |
+| c4 | BIGINT | per-part-categ:NULL(40) | 0.949 |
+| c5 | DOUBLE | low-ndv | **0.076** |
+| c6 | DOUBLE | zipf | 1.039 |
+| c7 | DOUBLE | uniform | 1.357 |
+| c8 | DOUBLE | per-part-categ | 0.991 |
+| c9 | DECIMAL | low-ndv | **0.079** |
+| c10 | DECIMAL | zipf | 1.580 |
+| c11 | DECIMAL | uniform | **2.371** ← heaviest |
+| c12 | DECIMAL | per-part-categ | 1.371 |
+| c13 | VARCHAR | low-ndv | **0.112** |
+| c14 | VARCHAR | zipf | 1.434 |
+| c15 | VARCHAR | uniform:NOTNULL | 2.090 |
+| c16 | VARCHAR | per-part-categ | **2.195** |
+| c17 | DATETIME | low-ndv | **0.076** |
+| c18 | DATETIME | zipf | 1.261 |
+| c19 | TIMESTAMP | uniform | 1.820 |
+| c20 | DATETIME | per-part-categ:NULL(40) | 1.029 |
+| idx_c14 | INDEX | - | 1.113 |
+| idx_c2_c19 | INDEX | - | 1.324 |
+
+Total PR merge function CPU across all columns + indexes: ~24 s.
+
+#### Patterns
+
+- **Low-NDV columns are 10–30× faster than any other distribution**
+  (0.076–0.112 s vs ~1 s+). TopN saturates → no histogram-bucket merge
+  is needed at all.
+- **DECIMAL uniform is the heaviest column on PR** (2.371 s) — full
+  bucket sort over canonical-byte-encoded keys.
+- **VARCHAR per-part-categ is the second heaviest** (2.195 s) — collation-
+  keyed sort with cross-partition non-overlapping ranges.
+- Type effect within a distribution (e.g. uniform): VARCHAR < DECIMAL,
+  consistent with collation-key length / decimal-canonical-byte cost.
+- Distribution effect: low-ndv < per-part-categ < zipf < uniform — TopN
+  saturation reduces histogram work, then bucket-sort cost grows with
+  cross-partition value diversity.
+- The ~13–15 s "gap to next column" between consecutive merges is per-
+  partition stats loading from `mysql.stats_*`, gRPC, codec — identical
+  on PR and BASE, where most of the 8m27s phase wallclock lives.
+
+If BASE's per-column ratios mirror PR's (with the ~70× function
+speedup measured at the function-CPU aggregate level), DECIMAL uniform
+alone would have taken **~3 minutes on BASE** vs PR's 2.4 s.
+
+## Resolved harness issues during the run
+
+- **macOS `pgrep -a` silently broken:** `find_tidb_log_path` /
+  `find_tikv_log_path` used `pgrep -af` which is Linux-only. macOS
+  pgrep ignores `-a` and returns just the PID, so the regex never
+  matched `--log-file=` and every per-iter log copy was a silent no-op.
+  All 8 matrix iters had no `tidb*.log` preserved. Fixed with a portable
+  `pgrep_argv` helper (`pgrep -f` for PIDs, `ps -p PID -o command=` for
+  args). The full-analyze-from-backup pair has logs preserved.
+- **`tidb_lock_wait_timeout` doesn't exist** in v9.0.0-beta.2; the
+  pessimistic-lock var is `innodb_lock_wait_timeout` (default 50 s).
+- **`disable_auto_analyze` heredoc + `set -e`:** the original
+  `if [[ $? -ne 0 ]]` after the heredoc-fed mysql exits the pipeline
+  immediately under `set -e` before the post-check runs. Switched to
+  `mysql … <<SQL || { log … }` so the failure is part of a control
+  expression.
 
 ## Raw artifact paths
 
