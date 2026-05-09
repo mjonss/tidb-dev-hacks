@@ -219,6 +219,49 @@ If BASE's per-column ratios mirror PR's (with the ~70× function
 speedup measured at the function-CPU aggregate level), DECIMAL uniform
 alone would have taken **~3 minutes on BASE** vs PR's 2.4 s.
 
+### Source-line attribution: where the merge time actually lives
+
+`go tool pprof -list <fn>` aggregated across all CPU profiles in each cell.
+
+**BASE** (one line dominates 80% of merge CPU):
+
+| Function | Line | cum (s) | Code |
+|---|---|---|---|
+| `MergePartTopN2GlobalTopN` | **190** | **1211** | `count, _ := hists[j].EqualRowCount(nil, datum, isIndex)` |
+| `MergePartTopN2GlobalTopN` | 181 | 159 | `datum, exists := datumMap.Get(encodedVal)` |
+| `MergePartTopN2GlobalTopN` | 177 | 73 | `if (j == i && version >= 2) \|\| topNs[j].FindTopN(val.Encoded) != -1` |
+| `MergePartTopN2GlobalTopN` | 173 | 48 | `if err := killer.HandleSignal(); err != nil` |
+| `MergePartTopN2GlobalTopN` | 194 | 16 | `hists[j].BinarySearchRemoveVal(&datum, int64(count))` |
+| `MergePartitionHist2GlobalHist` | 1671 | 11 | `err := sortBucketsByUpperBound(sc.TypeCtx(), buckets)` |
+
+The `EqualRowCount` call at line 190 is the O(TopN × P) loop:
+for each of ~100 TopN values × 21 columns × 8000 partitions, do a
+binary search over the partition's histogram. That's 16.8 M
+`EqualRowCount` calls per full-table ANALYZE merge phase.
+
+**PR** (no hotspot — spread across k-way merge ops):
+
+| Line | cum (s) | Code |
+|---|---|---|
+| 1720 | 15.2 | `bkt, _ := nextBucket()` |
+| 1651 | 8.7 | `entry := mergeHeap.popMin()` |
+| 1789 | 6.8 | `globalHist, err := buildGlobalHistogram(...)` |
+| 1657 | 4.2 | `mergeHeap.pushEntry(next)` |
+| 1656 | 2.2 | `firstNonEmptyBucket(entry.histIdx, int(entry.bucketIdx)+1)` |
+| 1735 | 0.5 | `entry.encoded, err = codec.EncodeKey(tz, nil, bkt.upper)` |
+| 1551 | 0.3 | `return bytes.Compare(a.encoded, b.encoded)` |
+
+PR replaces the O(TopN × P) lookup with one k-way merge walk through
+all partition buckets in sorted order. TopN values are identified
+inline as the merge cursor passes over them.
+
+Per-column line-level hotspots (sampled in the heaviest 3 columns)
+are uniform: `nextBucket` + heap ops + `buildGlobalHistogram` in the
+same order, with absolute times scaling with the column's
+`sortedRefs` / `totalBuckets` count. No type-specific hotspot
+emerges — the algorithmic cost is fully amortized across data
+shapes.
+
 ## Resolved harness issues during the run
 
 - **macOS `pgrep -a` silently broken:** `find_tidb_log_path` /
