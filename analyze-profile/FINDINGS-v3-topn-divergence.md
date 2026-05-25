@@ -84,14 +84,25 @@ BASE is double-counting (e.g. summing per-partition TopN counts and
 partition-bucket Repeats for the same value), or BASE is selecting
 TopN candidates from a sketch that overestimates frequency.
 
-If PR is right, then BASE has been silently over-estimating
-per-value selectivity on uniform DECIMAL / VARCHAR / TIMESTAMP
-columns. An equality predicate against one of BASE's top values
-would estimate ~8000 matching rows when the truth is ~3.
+**Verified against ground truth** (2026-05-25, see "Verification"
+section below): the actual maximum per-value count in c11 is **15**,
+and the top 10 values all have actual counts 14–15. So BASE
+(reports ~7,969) overcounts by ~530×; PR (reports ~9) undercounts
+by ~1.7×. PR is far closer to reality but is still ~40% low.
 
-If BASE is right, then PR is missing real hot values. The data
-generator strongly suggests PR is right, but that would need
-confirmation against the live cluster (see "How to confirm" below).
+The reason for PR's undercount: per-partition `pruneTopNItem`
+drops a value with `count=1` from any single partition's TopN. So
+a globally-hot value with true count=15 spread across 15 different
+partitions (count=1 each) is never admitted to any partition's
+TopN, and therefore never appears in the global merge candidate
+pool. PR's TopN ends up picking values that are concentrated in
+1–3 partitions (count≈4–5 per partition, count≈5–9 globally), not
+values that are globally hot but spread thin.
+
+BASE's `EqualRowCount` cross-partition path *would* in principle
+recover the spread-thin values' counts — but it does so via range
+estimation that inflates 530× past truth, which is worse than PR's
+undercount.
 
 ## Pattern 3 — small disagreement at the top-N boundary (`c12`, `c20`)
 
@@ -219,69 +230,81 @@ Pattern 2 is "Asymmetry B operating on real TopN candidates", and
 Pattern 3 is "neither asymmetry has much to work with — both algorithms
 land on essentially the same answer."
 
+## Verification (2026-05-25)
+
+Restored `combined-backup-v3` and ran a direct
+`GROUP BY c11 ORDER BY COUNT(*) DESC LIMIT 10` against the actual
+table. Result:
+
+```
++----------+--------------+
+| c11      | actual_count |
++----------+--------------+
+| 58935.54 |           15 |
+| 12630.90 |           15 |
+| 67853.54 |           15 |
+| 71095.63 |           15 |
+| 93275.21 |           15 |
+| 67039.47 |           15 |
+| 24471.72 |           14 |
+| 83113.38 |           14 |
+| 89548.09 |           14 |
+| 16469.74 |           14 |
++----------+--------------+
+```
+
+The actual max per-value count is **15**.
+
+| | Reported max count | Vs ground truth (15) |
+|---|---|---|
+| BASE TopN     | ~7,969 | **~530× too high** |
+| PR TopN       |     ~9 | ~1.7× too low |
+
+So BASE has been overestimating per-value selectivity on
+uniform DECIMAL / VARCHAR / TIMESTAMP columns by ~500× — the
+cross-partition `EqualRowCount` sum doesn't reflect anything real
+about the data. PR is much closer to the truth but still
+undercounts because the most globally-frequent values (true
+count=15 spread across 15 partitions with count=1 each) are
+rejected by each partition's `pruneTopNItem` and so never reach
+the global merge candidate pool.
+
 ## Implications
 
 - **Pattern 3**: benign, no action needed.
 
-- **Pattern 1**: a small TopN-quality cleanup — PR could skip
-  admitting `count=1` candidates into the global TopN. Saves 100
-  slots per affected column and is an easy improvement, but doesn't
-  produce any new optimizer regression because singleton TopN
-  entries don't drive plan decisions.
+- **Pattern 1** (c3/c7/pk singletons): PR currently fills 100 TopN
+  slots with `count=1` entries that carry no selectivity signal.
+  Cleanup option: gate the bucket-Repeat heap admission on
+  `entry.totalRepeat > 1`, or apply a `pruneTopNItem`-style global
+  prune after heap construction. Either matches BASE's behavior on
+  these columns and reduces stats noise. No optimizer accuracy
+  cost — the histogram fallback gives the same estimate either way.
 
-- **Pattern 2**: real and material if it points to BASE being
-  inaccurate. The PR's combined-merge rewrite is producing TopN
-  counts that match what you'd compute by hand from the data
-  generator. If pre-PR plans on this workload were calibrated against
-  BASE's inflated counts, switching to PR will lower selectivity
-  estimates for equality predicates on those columns and could shift
-  plan choices. That is either a fix (good) or a regression
-  (depends), but in either case it should be flagged so reviewers
-  don't dismiss any downstream plan changes as "no-op."
+- **Pattern 2** (c11/c15/c19 uniform-with-repeats): PR is
+  substantially more accurate than BASE (off by 1.7× vs 530×),
+  but applying `pruneTopNItem` *as-is* at the global level on PR
+  would over-prune, because PR's reported counts (~5–9) are
+  themselves systematically below truth (~14–15). A global
+  Wald-CI test calibrated on global NDV / row count would reject
+  candidates whose true count would have justified inclusion.
 
-## How to confirm
+  A better follow-up would be to make PR's counts more accurate
+  first — for example, when accumulating each global TopN
+  candidate's count, also walk the partition histograms for the
+  same value (similar to BASE's `EqualRowCount` step) but pull
+  *only the per-partition bucket Repeat*, not a range estimate.
+  Then `pruneTopNItem` at global level would discriminate
+  correctly.
 
-The "which side is right on Pattern 2" question can be settled with a
-direct count. After restoring `combined-backup-v3`:
-
-```sql
--- Pick the top-N first entry from BASE's stats_top_n for c11:
-SELECT value, count FROM mysql.stats_top_n
-WHERE table_id = (SELECT tidb_table_id('analyze_profile.t_partitioned'))
-  AND hist_id  = (SELECT column_id FROM information_schema.columns
-                  WHERE table_schema='analyze_profile' AND table_name='t_partitioned' AND column_name='c11')
-ORDER BY count DESC LIMIT 5;
-
--- Then verify the actual count of that decimal value in the table:
-SELECT COUNT(*) FROM analyze_profile.t_partitioned WHERE c11 = <one of those values>;
-```
-
-If the actual count is ~3 (matching PR), Pattern 2 is a BASE bug
-fixed in PR. If the actual count is ~8,000 (matching BASE), PR is
-under-counting and is a new regression.
-
-A second sanity check, looking for the double-count hypothesis:
-
-```sql
--- Does the same value appear as both a TopN entry and as the upper
--- bound of a partition bucket (where its Repeat would also count)?
-SELECT t.value, t.count AS topn_count,
-       b.repeats AS bucket_repeats, b.upper_bound, b.partition_id
-FROM mysql.stats_top_n t
-JOIN mysql.stats_buckets b
-  ON b.table_id = t.table_id AND b.hist_id = t.hist_id
- AND b.upper_bound = t.value
-WHERE t.table_id = (SELECT tidb_table_id('analyze_profile.t_partitioned'))
-  AND t.hist_id  = (SELECT column_id FROM information_schema.columns
-                    WHERE table_name='t_partitioned' AND column_name='c11')
-LIMIT 10;
-```
-
-If many matches come back on the BASE-side dump and few on the PR-
-side dump, BASE is double-counting.
-
-I haven't run these — they need the cluster restored (~15 min BR
-restore) and would settle the question.
+  Even without that, the PR's current state is a strict
+  improvement: 1.7× undercount is materially better than 530×
+  overcount for the optimizer's cardinality estimates on these
+  columns. Plans that were calibrated against BASE's inflated
+  counts will see lower estimates under PR — that is the *fix*,
+  not a regression, but reviewers should expect equality-predicate
+  cardinality changes on workloads that touch hot values of
+  uniform high-NDV columns.
 
 ## Why this didn't come up earlier
 
