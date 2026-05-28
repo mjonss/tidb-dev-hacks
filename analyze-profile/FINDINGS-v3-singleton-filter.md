@@ -233,39 +233,108 @@ satisfy *all* of:
 The current code on the branch corresponds to row 2 — `Pattern 1
 fixed, equivalence broken`.
 
-## Where this leaves us
+## Resolution: mirror the per-partition `allowPruning` trigger
 
-Two paths forward, both consistent with the rest of the
-findings:
+Re-reading `pkg/statistics/builder.go` around the
+`processTopNValue` / `pruneTopNItem` call site surfaced the rule
+the per-partition path already encodes:
 
-**Path A — revert the filter.** Restore the pre-filter `>= 0`
-admission at heap.Add, drop the post-heap filter and the
-`TestMergePartTopNAndHistToGlobalSingletonFilter` test, and revert
-the `TestGlobalStatsMergeCombined` expectation changes to their
-pre-filter values. Pattern 1's 100 noise singletons return as a
-documented but-not-acted-on observation in
-`FINDINGS-v3-topn-divergence.md`. The partitioned ≡
-non-partitioned invariant is preserved by default.
+```go
+// pkg/statistics/builder.go (constants.go: DefaultTopNValue = 100)
+allowPruning := true
+if numTopN != DefaultTopNValue {
+    allowPruning = false
+}
+...
+if allowPruning {
+    prunedTopNItems = pruneTopNItem(sortedTopNItems, ndv, nullCount, sampleNum, count)
+}
+```
 
-**Path B — invest in a smarter discriminator.** Probably `candidateCount`-
-gated: track the number of distinct candidates seen during the
-merge walk and only apply the singleton filter when the pool is
-much larger than `numTopN`. Worth doing only if we can prove that
-on every input shape, the global filter's decision matches the
-per-partition `pruneTopNItem`'s decision on the equivalent
-non-partitioned input. That probably means actually porting the
-statistical test from `pruneTopNItem` and giving it the right
-"sample size" interpretation for global counts (a non-trivial
-modelling question, since the global count is a sum of per-
-partition observations, not a single hypergeometric draw).
+Per-partition pruning is gated on `numTopN == DefaultTopNValue`.
+Any `with N topn` clause from the user is treated as "honor what I
+asked for"; `pruneTopNItem` is skipped entirely. That is exactly
+why the empirical `t_np` (non-partitioned) test in the previous
+section kept its singletons — `with 1 topn` and `with 2 topn` both
+disable pruning.
 
-The remaining engineering risk is that Path B's smarter
-discriminator inherits the partitioned vs non-partitioned constraint
-as a hard requirement: any filter that says "I keep this entry on a
-non-partitioned 5-row table" must also say so on the partitioned
-equivalent. Encoding that property in the global merge probably
-needs more state than the current code carries, because the
-per-partition pruner decides per partition and the global side
-currently only sees the survivors.
+Adding the same gate to the global filter restores the
+partitioned ≡ non-partitioned invariant by construction. The
+filter in `MergePartTopNAndHistToGlobal` step 1d becomes:
 
-The decision between Path A and Path B is the next conversation.
+```go
+// Drop singleton (count==1) candidates when both gates hold:
+//   (a) numTopN is the default — same trigger the per-partition
+//       builder uses to enable pruneTopNItem. An explicit
+//       `with N topn` override turns off per-partition pruning,
+//       so the global merge must leave its output alone to
+//       preserve the partitioned ≡ non-partitioned invariant.
+//   (b) the heap filled to capacity — singletons are then a
+//       sample of a candidate pool larger than numTopN slots,
+//       carrying no selectivity signal beyond the histogram +
+//       NDV fallback. When the heap stays below capacity every
+//       distinct candidate fit; keep them.
+if numTopN == DefaultTopNValue && uint32(len(topNSlice)) >= numTopN {
+    filtered := topNSlice[:0]
+    for _, e := range topNSlice {
+        if e.totalRepeat >= 2 {
+            filtered = append(filtered, e)
+        }
+    }
+    topNSlice = filtered
+}
+```
+
+Crossing the gate against every scenario considered earlier:
+
+| Scenario | `numTopN` | `numTopN==Default`? | Heap full? | Filter? | Equivalence? |
+|---|---|---|---|---|---|
+| Pattern 1 bench (`c3`, default analyze) | 100 | ✓ | ✓ (100 of ~30M) | apply | ✓ |
+| `TestAnalyzeWithDynamicPartitionPruneMode` (`with 1 topn`) | 1 | ✗ | — | skip | ✓ matches `t_np` |
+| `TestAnalyzeGlobalStatsWithOpts1` (`with 1 topn`) | 1 | ✗ | — | skip | ✓ |
+| `TestInitStatsForPartitionedTable` (`with 2 topn`) | 2 | ✗ | — | skip | ✓ |
+| `TestGlobalStatsMergeCombined` (`with 1 topn`) | 1 | ✗ | — | skip | ✓ original expectations restored |
+| `TestGlobalStats` (default 20) | 20 | ✗ | — | skip | ✓ |
+| Tiny table, default 100, 5 unique values | 100 | ✓ | ✗ (5 < 100) | skip | ✓ singletons kept on both sides |
+| Default 100, ~200 unique values | 100 | ✓ | ✓ | apply | ✓ noise dropped |
+
+### Result of the implementation
+
+After installing the `numTopN == DefaultTopNValue` gate and
+updating the unit test
+(`TestMergePartTopNAndHistToGlobalSingletonFilter` now has three
+subtests, covering each branch of the gate):
+
+| Test | State |
+|---|---|
+| `TestAnalyzeWithDynamicPartitionPruneMode` | ✅ now passes |
+| `TestAnalyzeGlobalStatsWithOpts1` | ✅ now passes |
+| `TestInitStatsForPartitionedTable` | ✅ now passes |
+| `TestGlobalStatsMergeCombined` (expectations reverted to pre-filter) | ✅ now passes |
+| `TestMergePartTopNAndHistToGlobalSingletonFilter` (3 subtests) | ✅ passes |
+| All other merge / globalstats tests | ✅ pass |
+| `TestInitStatsMemoryFullBlocksBucketsButKeepsTopN` | ❌ pre-existing, unrelated |
+| `TestIncrementalModifyCountUpdate` | ❌ pre-existing, unrelated |
+| `TestStatsCacheUpdateTimeout` | ❌ pre-existing, unrelated |
+| `TestExpBackoffEstimation` | ❌ pre-existing, unrelated |
+
+The four remaining failures all fail on the pre-filter PR
+(`63d8b20af9`) too, confirmed by bisecting. They are independent
+of the singleton filter.
+
+### Why the rule generalizes
+
+The `DefaultTopNValue` gate is not a magic threshold; it is a
+contract: *if the user wrote `with N topn`, neither the
+per-partition nor the global pruner is allowed to drop their
+entries*. The per-partition side already implements that contract.
+Mirroring it at the global level makes the merge's output
+indistinguishable from the equivalent non-partitioned analyze for
+all explicit-`numTopN` workloads, by construction, and lets
+Pattern 1 (default `numTopN`, large NDV) still be cleaned up.
+
+The heap-at-capacity sub-gate (`len(topNSlice) >= numTopN`) is the
+additional, internal-to-the-merge discriminator that separates
+"sample of large pool" from "small enumeration that happens to fit
+the default slot count." Together the two gates pass every
+scenario considered above.
