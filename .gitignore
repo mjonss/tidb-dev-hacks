@@ -30,6 +30,13 @@ go.work.sum
 # Output directories
 output/
 
+# analyze-profile: benchmark output, BR backups, and built binaries.
+# These are large (tens of GB) and regenerable; never commit them.
+analyze-profile/output-bench-*/
+analyze-profile/combined-backup-*/
+analyze-profile/analyze-profile
+analyze-profile/tidb-server.*
+
 # Editor/IDE
 # .idea/
 # .vscode/

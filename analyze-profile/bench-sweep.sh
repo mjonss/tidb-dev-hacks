@@ -152,6 +152,34 @@ disable_auto_analyze() {
 SET GLOBAL tidb_enable_auto_analyze = OFF;
 SET GLOBAL innodb_lock_wait_timeout = 600;
 SQL
+  set_merge_concurrency
+}
+
+# Sweep hook (bench-sweep.sh only): set tidb_merge_partition_stats_concurrency.
+#
+# BASE dispatches on this in globalstats/topn.go: `if mergeConcurrency < 2` uses
+# the single-threaded MergePartTopN2GlobalTopN, otherwise the worker-pool
+# MergeGlobalStatsTopNByConcurrency. The default is 1, so the main v5 matrix
+# measures BASE single-threaded on a 16-core box. The PR deletes this knob, so
+# the sweep asks what it was worth before we claim a speedup against BASE.
+#
+# Read back and assert: on the PR the sysvar is a deprecation no-op whose read
+# paths always return "1", so a silently-ignored SET here would otherwise be
+# indistinguishable from a real one and produce a bogus "concurrency doesn't
+# help" result. Fail loudly instead.
+set_merge_concurrency() {
+  [[ -n "${MERGE_STATS_CONCURRENCY:-}" ]] || return 0
+  log "Setting tidb_merge_partition_stats_concurrency = ${MERGE_STATS_CONCURRENCY}"
+  mysql -h 127.0.0.1 -P 4000 -u root \
+    -e "SET GLOBAL tidb_merge_partition_stats_concurrency = ${MERGE_STATS_CONCURRENCY};" \
+    >/dev/null 2>&1 || log "WARN: SET merge concurrency returned an error"
+  local got
+  got="$(mysql -h 127.0.0.1 -P 4000 -u root -N -B \
+    -e "SELECT @@global.tidb_merge_partition_stats_concurrency;" 2>/dev/null || echo "?")"
+  if [[ "${got}" != "${MERGE_STATS_CONCURRENCY}" ]]; then
+    die "merge concurrency did not take: wanted ${MERGE_STATS_CONCURRENCY}, cluster reports '${got}' (deprecated no-op binary?)"
+  fi
+  log "merge concurrency confirmed = ${got}"
 }
 
 # Return the tiup-playground binary PID (the actual component that spawns
